@@ -1,259 +1,187 @@
-// The DOM HUD: health, ammo, money, timer, score, kill feed, bomb status,
-// buy menu, banners and the crosshair. It never touches the simulation;
-// main.js pushes numbers in and reads callbacks out. Every setter is cheap
-// and skips work when nothing changed, so it can run every frame.
+// The HUD: health and armor, ammo, money, the round timer, the
+// team score, the kill feed, the bomb status, weapon slots, a
+// crosshair whose gap reflects spread, a red hitmarker for headshots,
+// a damage direction indicator, the buy menu and the round banner.
+// Every element lives in index.html; this module only writes to it,
+// and only when a value actually changed.
+import { formatClock, formatMoney } from './util.js';
+import { BUY_MENU } from './weapons.js';
 
-import { formatMoney, formatTimer } from './util.js';
+function setText(el, value) {
+  if (el && el.textContent !== value) el.textContent = value;
+}
 
-const OVERLAY_TEXT = {
-  start: {
-    title: 'DUSTLINE',
-    copy: 'A tactical FPS in a freight yard at dusk. Plant the bomb at A or B, or wipe out EMBER. Click to play.',
-    action: 'Click to play',
-  },
-  paused: {
-    title: 'DUSTLINE',
-    copy: 'Paused. Click to resume.',
-    action: 'Click to resume',
-  },
-  matchWin: {
-    title: 'VANGUARD WINS',
-    copy: 'The yard is yours. EMBER never stood a chance.',
-    action: 'Play again',
-  },
-  matchLose: {
-    title: 'EMBER WINS',
-    copy: 'The yard stays theirs. Run it back.',
-    action: 'Play again',
-  },
-};
-
-export function createHud() {
-  const $ = (id) => document.getElementById(id);
-  const overlay = $('overlay');
-  const overlayTitle = $('overlay-title');
-  const overlayCopy = $('overlay-copy');
-  const playButton = $('play');
-  const hudRoot = $('hud');
-  const timerEl = $('timer');
-  const scoreVEl = $('score-v');
-  const scoreEEl = $('score-e');
-  const roundLabel = $('round-label');
-  const healthNum = $('health-num');
-  const healthBar = $('health-bar');
-  const armorBadge = $('armor');
-  const ammoMag = $('ammo-mag');
-  const ammoReserve = $('ammo-reserve');
-  const weaponName = $('weapon-name');
-  const moneyEl = $('money');
-  const grenadesEl = $('grenades');
-  const slotsEl = $('slots');
-  const feedEl = $('feed');
-  const bombStatus = $('bomb-status');
-  const crosshair = $('crosshair');
-  const hitmarker = $('hitmarker');
-  const damageVignette = $('damage-vignette');
-  const damageDir = $('damage-dir');
-  const buyMenu = $('buy-menu');
-  const buyItems = $('buy-items');
-  const buyMoney = $('buy-money');
-  const banner = $('banner');
-  const bannerTitle = $('banner-title');
-  const bannerSub = $('banner-sub');
-  const actionBar = $('action-bar');
-  const actionLabel = $('action-label');
-  const actionFill = $('action-fill');
-
-  let hitTimer = 0;
-  let damageTimer = 0;
-  let bannerTimer = 0;
-  let last = {};
-  let buyHandler = null;
-
-  // Set text only when it changed — the cheapest DOM write is the one skipped.
-  function setText(el, key, value) {
-    if (last[key] === value) return;
-    last[key] = value;
-    el.textContent = value;
+export class Hud {
+  constructor() {
+    this.el = {};
+    for (const id of [
+      'hud', 'health', 'armor', 'ammo', 'reserve', 'money', 'timer', 'score',
+      'round', 'killfeed', 'bomb-status', 'slots', 'crosshair', 'hitmarker',
+      'damage-dir', 'banner', 'banner-title', 'banner-sub', 'buy-menu',
+      'buy-list', 'overlay', 'overlay-title', 'overlay-sub', 'overlay-hint',
+      'plant-bar', 'plant-fill', 'plant-label', 'site-label', 'objective',
+    ]) {
+      this.el[id] = document.getElementById(id);
+    }
+    this.lastCrossGap = -1;
+    this.lastHealth = -1;
+    this.hitAt = 0;
+    this.damageAt = 0;
+    this.buildBuyMenu();
   }
 
-  return {
-    setHealth(hp) {
-      setText(healthNum, 'hp', String(Math.max(0, Math.ceil(hp))));
-      const pct = Math.max(0, Math.min(100, hp));
-      if (last.hpPct !== pct) {
-        last.hpPct = pct;
-        healthBar.style.width = `${pct}%`;
-        healthBar.classList.toggle('low', pct <= 30);
+  buildBuyMenu() {
+    const list = this.el['buy-list'];
+    if (!list) return;
+    list.innerHTML = '';
+    for (const item of BUY_MENU) {
+      const row = document.createElement('div');
+      row.className = 'buy-row';
+      row.dataset.item = item.id;
+      row.innerHTML = `<span class="buy-key">${item.key}</span><span class="buy-name">${item.label}</span><span class="buy-note">${item.note}</span><span class="buy-price">${item.price === 0 ? 'FREE' : formatMoney(item.price)}</span>`;
+      list.appendChild(row);
+    }
+  }
+
+  showBuyMenu(show, money) {
+    if (!this.el['buy-menu']) return;
+    this.el['buy-menu'].classList.toggle('hidden', !show);
+    if (show) {
+      setText(this.el.money, formatMoney(money));
+      for (const row of this.el['buy-list'].children) {
+        const item = BUY_MENU.find((b) => b.id === row.dataset.item);
+        row.classList.toggle('poor', item && money < item.price);
       }
-    },
+    }
+  }
 
-    setArmor(hasArmor) {
-      if (last.armor === hasArmor) return;
-      last.armor = hasArmor;
-      armorBadge.hidden = !hasArmor;
-    },
+  flashBuy(itemId, result) {
+    const row = this.el['buy-list']?.querySelector(`[data-item="${itemId}"]`);
+    if (!row) return;
+    row.classList.remove('bought', 'denied');
+    void row.offsetWidth;
+    row.classList.add(result === 'ok' ? 'bought' : 'denied');
+  }
 
-    setAmmo(mag, reserve) {
-      setText(ammoMag, 'mag', String(mag));
-      setText(ammoReserve, 'res', `/ ${reserve}`);
-      const empty = mag === 0;
-      if (last.empty !== empty) {
-        last.empty = empty;
-        ammoMag.classList.toggle('empty', empty);
+  update(state) {
+    const { player, economy, match, bomb, spread } = state;
+    if (this.el.hud) this.el.hud.classList.toggle('hidden', match.phase === 'menu');
+    setText(this.el.health, String(Math.ceil(player.health)));
+    if (this.el.health) {
+      this.el.health.classList.toggle('low', player.health <= 30);
+    }
+    setText(this.el.armor, economy.hasKevlar ? String(Math.ceil(player.armor)) : '—');
+    const weapon = player.currentWeapon;
+    if (weapon) {
+      setText(this.el.ammo, String(weapon.mag));
+      setText(this.el.reserve, String(weapon.reserve));
+    }
+    setText(this.el.money, formatMoney(economy.money));
+    setText(this.el.timer, formatClock(match.clock));
+    if (this.el.timer) this.el.timer.classList.toggle('low', match.phase === 'live' && match.clock <= 10);
+    setText(this.el.score, match.scoreText());
+    setText(this.el.round, `ROUND ${match.round} / 9`);
+    // Crosshair gap follows spread; aiming pulls it tight.
+    const gap = Math.round(4 + spread * 260);
+    if (gap !== this.lastCrossGap && this.el.crosshair) {
+      this.el.crosshair.style.setProperty('--gap', `${gap}px`);
+      this.lastCrossGap = gap;
+    }
+    if (this.el.crosshair) this.el.crosshair.classList.toggle('hidden', match.phase !== 'live');
+    // Weapon slots.
+    if (this.el.slots) {
+      const html = player.slots.map((slot, i) => {
+        const active = i === player.currentSlot ? ' active' : '';
+        const empty = slot.mag === 0 && slot.reserve === 0 ? ' empty' : '';
+        return `<span class="slot${active}${empty}">${i + 1} ${slot.def.name} ${slot.mag}/${slot.reserve}</span>`;
+      }).join('');
+      if (this.el.slots.dataset.html !== html) {
+        this.el.slots.innerHTML = html;
+        this.el.slots.dataset.html = html;
       }
-    },
+    }
+    // Bomb status line.
+    let bombText = '';
+    if (bomb.state === 'carried') bombText = bomb.carrier === player ? 'BOMB: YOU CARRY IT — PLANT AT A OR B' : 'BOMB: WITH YOUR TEAM';
+    else if (bomb.state === 'dropped') bombText = 'BOMB: DROPPED — WALK OVER IT TO PICK UP';
+    else if (bomb.state === 'planted') bombText = `BOMB PLANTED AT ${bomb.site} — ${formatClock(bomb.timer)} TO DETONATION`;
+    else if (bomb.state === 'exploded') bombText = 'BOMB DETONATED';
+    else if (bomb.state === 'defused') bombText = 'BOMB DEFUSED';
+    setText(this.el['bomb-status'], bombText);
+    if (this.el['bomb-status']) this.el['bomb-status'].classList.toggle('danger', bomb.state === 'planted');
+    // Plant / defuse progress bar.
+    const progress = bomb.plantProgress > 0 ? bomb.plantProgress : bomb.defuseProgress;
+    const label = bomb.plantProgress > 0 ? 'PLANTING…' : bomb.defuseProgress > 0 ? 'DEFUSING…' : '';
+    if (this.el['plant-bar']) {
+      this.el['plant-bar'].classList.toggle('hidden', progress <= 0);
+      if (progress > 0 && this.el['plant-fill']) this.el['plant-fill'].style.width = `${Math.round(progress * 100)}%`;
+      setText(this.el['plant-label'], label);
+    }
+    // Objective line: which site the carrier should hit.
+    if (match.phase === 'live' && bomb.state === 'carried') {
+      setText(this.el.objective, bomb.carrier === player ? 'PLANT THE BOMB AT A (WAREHOUSE) OR B (FUEL DEPOT)' : 'ESCORT THE BOMB CARRIER TO A OR B');
+    } else if (match.phase === 'buy') {
+      setText(this.el.objective, 'BUY PHASE — PRESS B FOR THE BUY MENU');
+    } else {
+      setText(this.el.objective, '');
+    }
+  }
 
-    setWeapon(name, grenadeCount) {
-      setText(weaponName, 'weapon', name);
-      setText(grenadesEl, 'grenades', grenadeCount > 0 ? `◉ ${grenadeCount}` : '');
-    },
+  showHitmarker(headshot) {
+    if (!this.el.hitmarker) return;
+    this.el.hitmarker.classList.remove('head', 'show');
+    void this.el.hitmarker.offsetWidth;
+    if (headshot) this.el.hitmarker.classList.add('head');
+    this.el.hitmarker.classList.add('show');
+    this.hitAt = performance.now();
+  }
 
-    setMoney(value) {
-      setText(moneyEl, 'money', formatMoney(value));
-      setText(buyMoney, 'buyMoney', formatMoney(value));
-    },
+  showDamageFrom(angleDeg) {
+    const el = this.el['damage-dir'];
+    if (!el) return;
+    el.style.setProperty('--rot', `${angleDeg}deg`);
+    el.classList.remove('show');
+    void el.offsetWidth;
+    el.classList.add('show');
+    this.damageAt = performance.now();
+  }
 
-    setTimer(seconds, phase) {
-      const text = phase === 'buy' ? `BUY ${formatTimer(seconds)}` : formatTimer(seconds);
-      setText(timerEl, 'timer', text);
-      const urgent = phase === 'live' && seconds <= 15;
-      if (last.urgent !== urgent) {
-        last.urgent = urgent;
-        timerEl.classList.toggle('urgent', urgent);
-      }
-    },
+  addKill(killer, victim, headshot) {
+    const feed = this.el.killfeed;
+    if (!feed) return;
+    const row = document.createElement('div');
+    row.className = 'kill-row';
+    row.innerHTML = `<span class="killer">${killer}</span><span class="kill-weapon">${headshot ? '◉' : '✕'}</span><span class="victim">${victim}</span>`;
+    feed.prepend(row);
+    while (feed.children.length > 5) feed.removeChild(feed.lastChild);
+    setTimeout(() => row.classList.add('fade'), 4200);
+    setTimeout(() => row.remove(), 5000);
+  }
 
-    setScore(v, e, round, maxRounds) {
-      setText(scoreVEl, 'sv', String(v));
-      setText(scoreEEl, 'se', String(e));
-      setText(roundLabel, 'round', `ROUND ${round} / ${maxRounds}`);
-    },
+  showBanner(title, sub, team) {
+    if (!this.el.banner) return;
+    setText(this.el['banner-title'], title);
+    setText(this.el['banner-sub'], sub);
+    this.el.banner.classList.remove('hidden', 'vanguard', 'ember');
+    if (team) this.el.banner.classList.add(team);
+    this.el.banner.classList.add('show');
+    clearTimeout(this.bannerTimer);
+    this.bannerTimer = setTimeout(() => this.el.banner.classList.remove('show'), 3800);
+  }
 
-    setSlots(list, current) {
-      const key = `${list.map((s) => `${s.key}:${s.name}:${s.owned}`).join('|')}|${current}`;
-      if (last.slots === key) return;
-      last.slots = key;
-      slotsEl.innerHTML = list.map((s) => (
-        `<span class="slot${s.owned ? '' : ' locked'}${s.id === current ? ' current' : ''}">${s.key} ${s.name}</span>`
-      )).join('');
-    },
+  showOverlay(title, sub, hint) {
+    if (!this.el.overlay) return;
+    setText(this.el['overlay-title'], title);
+    setText(this.el['overlay-sub'], sub);
+    setText(this.el['overlay-hint'], hint);
+    this.el.overlay.classList.remove('hidden');
+  }
 
-    setBomb(text, urgent) {
-      setText(bombStatus, 'bomb', text);
-      if (last.bombUrgent !== urgent) {
-        last.bombUrgent = urgent;
-        bombStatus.classList.toggle('urgent', urgent);
-      }
-      bombStatus.hidden = text === '';
-    },
+  hideOverlay() {
+    this.el.overlay?.classList.add('hidden');
+  }
 
-    setCrosshair(spreadPx) {
-      crosshair.style.setProperty('--gap', `${spreadPx.toFixed(1)}px`);
-    },
-
-    hitMarker(killed, headshot) {
-      hitmarker.classList.add('on');
-      hitmarker.classList.toggle('head', headshot);
-      hitmarker.style.transform = killed ? 'translate(-50%, -50%) rotate(45deg) scale(1.3)' : '';
-      clearTimeout(hitTimer);
-      hitTimer = setTimeout(() => {
-        hitmarker.classList.remove('on');
-        hitmarker.classList.remove('head');
-        hitmarker.style.transform = '';
-      }, killed ? 160 : 90);
-    },
-
-    damageFrom(angleDeg) {
-      damageVignette.classList.add('on');
-      damageDir.style.transform = `rotate(${angleDeg}deg)`;
-      damageDir.classList.add('on');
-      clearTimeout(damageTimer);
-      damageTimer = setTimeout(() => {
-        damageVignette.classList.remove('on');
-        damageDir.classList.remove('on');
-      }, 450);
-    },
-
-    addKill(attacker, weapon, victim, headshot) {
-      const line = document.createElement('div');
-      line.className = 'feed-line';
-      line.innerHTML = `<span class="feed-a">${attacker}</span> <span class="feed-w">[${weapon}${headshot ? ' ★' : ''}]</span> <span class="feed-v">${victim}</span>`;
-      feedEl.prepend(line);
-      while (feedEl.children.length > 5) feedEl.removeChild(feedEl.lastChild);
-      setTimeout(() => line.classList.add('fade'), 4200);
-      setTimeout(() => line.remove(), 5000);
-    },
-
-    showBanner(titleText, subText) {
-      bannerTitle.textContent = titleText;
-      bannerSub.textContent = subText;
-      banner.hidden = false;
-      clearTimeout(bannerTimer);
-      // In a ?shot= capture the banner must stay up for the screenshot; in
-      // live play it fades after a few seconds.
-      if (new URLSearchParams(window.location.search).has('shot')) return;
-      bannerTimer = setTimeout(() => {
-        banner.hidden = true;
-      }, 3200);
-    },
-
-    hideBanner() {
-      banner.hidden = true;
-    },
-
-    showAction(label, progress) {
-      actionBar.hidden = false;
-      setText(actionLabel, 'action', label);
-      actionFill.style.width = `${Math.round(progress * 100)}%`;
-    },
-
-    hideAction() {
-      actionBar.hidden = true;
-    },
-
-    showBuy(items) {
-      buyMenu.hidden = false;
-      buyItems.innerHTML = items.map((item) => (
-        `<button class="buy-item${item.owned ? ' owned' : ''}${item.affordable ? '' : ' poor'}" data-buy="${item.id}">
-          <span class="buy-key">${item.key}</span>
-          <span class="buy-name">${item.name}</span>
-          <span class="buy-desc">${item.desc}</span>
-          <span class="buy-price">${item.owned ? 'OWNED' : formatMoney(item.price)}</span>
-        </button>`
-      )).join('');
-      buyItems.querySelectorAll('[data-buy]').forEach((button) => {
-        button.addEventListener('click', () => {
-          if (buyHandler) buyHandler(button.dataset.buy);
-        });
-      });
-    },
-
-    hideBuy() {
-      buyMenu.hidden = true;
-    },
-
-    onBuy(handler) {
-      buyHandler = handler;
-    },
-
-    showOverlay(mode) {
-      const text = OVERLAY_TEXT[mode];
-      overlayTitle.textContent = text.title;
-      overlayCopy.textContent = text.copy;
-      playButton.textContent = text.action;
-      overlay.hidden = false;
-      hudRoot.hidden = true;
-      playButton.focus();
-    },
-
-    hideOverlay() {
-      overlay.hidden = true;
-      hudRoot.hidden = false;
-    },
-
-    onPlay(handler) {
-      playButton.addEventListener('click', handler);
-    },
-  };
+  setSiteLabel(text) {
+    setText(this.el['site-label'], text);
+  }
 }

@@ -1,44 +1,62 @@
-// Tiny shared helpers used all over the game: a deterministic RNG so the
-// ?shot= captures render the same frame every time, plus the clamps, lerps
-// and angle math the simulation leans on. Nothing here allocates in a hot
-// loop — the RNG closes over one integer and the rest are pure arithmetic.
+// Small shared helpers: clamping, interpolation, a seeded random
+// generator (so staged screenshots and bot behaviour are repeatable),
+// and the few vector helpers the simulation needs. No allocations in
+// the hot path: callers reuse the scratch values they pass in.
+export function clamp(value, min, max) {
+  return value < min ? min : value > max ? max : value;
+}
 
+export function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// mulberry32: a tiny deterministic PRNG. The seed comes from the URL
+// (?seed=) so a staged screenshot renders the same scene every time.
 export function mulberry32(seed) {
-  let state = seed | 0;
+  let state = seed >>> 0;
   return function next() {
-    state = (state + 0x6d2b79f5) | 0;
-    let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
-    mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
-    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-export function clamp(value, low, high) {
-  if (value < low) return low;
-  if (value > high) return high;
-  return value;
+export function randomIn(rng, min, max) {
+  return min + rng() * (max - min);
 }
 
-export function lerp(from, to, t) {
-  return from + (to - from) * t;
+export function randomPick(rng, list) {
+  return list[Math.floor(rng() * list.length)];
 }
 
-// The shortest signed turn from one yaw to another, in (-PI, PI]. Bots use it
-// to turn toward a waypoint or a target without spinning the long way round.
+// Shortest signed turn from angle `from` toward angle `to`.
 export function angleDelta(from, to) {
-  let diff = (to - from) % (Math.PI * 2);
-  if (diff > Math.PI) diff -= Math.PI * 2;
-  if (diff < -Math.PI) diff += Math.PI * 2;
-  return diff;
+  let d = (to - from) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+export function angleLerp(from, to, t) {
+  return from + angleDelta(from, to) * clamp(t, 0, 1);
+}
+
+// Squared distance on the ground plane; the sim rarely needs a sqrt.
+export function dist2DSq(ax, az, bx, bz) {
+  const dx = ax - bx;
+  const dz = az - bz;
+  return dx * dx + dz * dz;
+}
+
+export function formatClock(seconds) {
+  const total = Math.max(0, Math.ceil(seconds));
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return `${minutes}:${rest < 10 ? '0' : ''}${rest}`;
 }
 
 export function formatMoney(amount) {
   return `$${Math.round(amount)}`;
-}
-
-export function formatTimer(seconds) {
-  const total = Math.max(0, Math.ceil(seconds));
-  const minutes = Math.floor(total / 60);
-  const rest = String(total % 60).padStart(2, '0');
-  return `${minutes}:${rest}`;
 }

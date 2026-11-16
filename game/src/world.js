@@ -1,186 +1,373 @@
-// The map: DUSTLINE YARD, a freight yard at dusk, built from boxes and
-// cylinders. Two bomb sites (A: warehouse north-west, B: fuel depot
-// north-east), three lanes from the attacker spawn in the south (Long A west,
-// Mid centre, Long B east), and a wall with two doors separating mid from the
-// sites. Every solid box is a collider for players and bots and a surface a
-// bullet stops on. Plain geometry only — no models, no textures, no network.
-
+// DUSTLINE's map: a freight yard at dusk. A warehouse holds site A
+// on the west side, a fuel depot holds site B on the east, and rusted
+// containers stack into three lanes between the two spawns. Every
+// solid thing registers an AABB collider for movement and a mesh for
+// the raycaster, so walls really do block sight and bullets.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
+import { randomIn } from './util.js';
 
-const WALL_H = 4.6;
+export const YARD = { minX: -40, maxX: 40, minZ: -30, maxZ: 30, wallHeight: 4.5 };
 
-export function createWorld(scene) {
-  const group = new THREE.Group();
-  scene.add(group);
+export const SITES = {
+  A: { id: 'A', name: 'WAREHOUSE', center: { x: -27, z: 0 }, radius: 7, color: PALETTE.siteA },
+  B: { id: 'B', name: 'FUEL DEPOT', center: { x: 30, z: 2 }, radius: 7, color: PALETTE.siteB },
+};
 
-  const materials = {};
-  function material(name) {
-    if (!materials[name]) {
-      materials[name] = new THREE.MeshStandardMaterial({
-        color: new THREE.Color(PALETTE[name]),
-        roughness: 0.9,
-        metalness: 0.02,
-      });
+export const SPAWNS = {
+  vanguard: [
+    { x: -6, z: 26 }, { x: -2, z: 27 }, { x: 2, z: 27 }, { x: 6, z: 26 },
+  ],
+  ember: [
+    { x: -6, z: -26 }, { x: -2, z: -27 }, { x: 2, z: -27 }, { x: 6, z: -26 },
+  ],
+};
+
+// Waypoint graph: lanes the bots path along. Edges are two-way.
+const WAYPOINT_DEFS = [
+  { id: 'vspawn', x: 0, z: 25 },
+  { id: 'south', x: 0, z: 14 },
+  { id: 'mid', x: 0, z: 0 },
+  { id: 'north', x: 0, z: -14 },
+  { id: 'espawn', x: 0, z: -25 },
+  { id: 'west1', x: -14, z: 18 },
+  { id: 'west2', x: -20, z: 8 },
+  { id: 'west3', x: -24, z: -4 },
+  { id: 'adoor', x: -20, z: 0 },
+  { id: 'asite', x: -27, z: 0 },
+  { id: 'east1', x: 14, z: 18 },
+  { id: 'east2', x: 20, z: 8 },
+  { id: 'east3', x: 24, z: -4 },
+  { id: 'bdoor', x: 22, z: 2 },
+  { id: 'bsite', x: 30, z: 2 },
+  { id: 'crossw', x: -14, z: -8 },
+  { id: 'crosse', x: 14, z: -8 },
+  { id: 'yardw', x: -30, z: 18 },
+  { id: 'yarde', x: 30, z: 18 },
+];
+
+const WAYPOINT_EDGES = [
+  ['vspawn', 'south'], ['south', 'mid'], ['mid', 'north'], ['north', 'espawn'],
+  ['vspawn', 'west1'], ['west1', 'west2'], ['west2', 'adoor'], ['adoor', 'asite'],
+  ['west2', 'west3'], ['west3', 'crossw'], ['crossw', 'north'],
+  ['vspawn', 'east1'], ['east1', 'east2'], ['east2', 'bdoor'], ['bdoor', 'bsite'],
+  ['east2', 'east3'], ['east3', 'crosse'], ['crosse', 'north'],
+  ['south', 'west1'], ['south', 'east1'], ['mid', 'west3'], ['mid', 'east3'],
+  ['mid', 'crossw'], ['mid', 'crosse'], ['west1', 'yardw'], ['yardw', 'adoor'],
+  ['east1', 'yarde'], ['yarde', 'bdoor'],
+];
+
+// Breadth-first shortest path over the waypoint graph, as node ids.
+export function findPath(graph, fromId, toId) {
+  if (fromId === toId) return [toId];
+  const prev = new Map([[fromId, null]]);
+  const queue = [fromId];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    for (const next of graph.edges.get(current) ?? []) {
+      if (prev.has(next)) continue;
+      prev.set(next, current);
+      if (next === toId) {
+        const path = [toId];
+        let node = toId;
+        while (prev.get(node) !== null) {
+          node = prev.get(node);
+          path.unshift(node);
+        }
+        return path;
+      }
+      queue.push(next);
     }
-    return materials[name];
   }
-  const siteMat = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(PALETTE.accent),
-    transparent: true,
-    opacity: 0.18,
-    depthWrite: false,
-  });
+  return [toId];
+}
 
-  const colliders = [];
-  const meshes = [];
+function buildWaypointGraph() {
+  const nodes = new Map(WAYPOINT_DEFS.map((w) => [w.id, w]));
+  const edges = new Map(WAYPOINT_DEFS.map((w) => [w.id, []]));
+  for (const [a, b] of WAYPOINT_EDGES) {
+    edges.get(a).push(b);
+    edges.get(b).push(a);
+  }
+  return { nodes, edges };
+}
 
-  // Add a solid box: [width, height, depth, x, y, z, palette name].
-  function addBox([w, h, d, x, y, z, mat]) {
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material(mat));
+export function nearestWaypoint(graph, x, z) {
+  let best = null;
+  let bestDist = Infinity;
+  for (const node of graph.nodes.values()) {
+    const dx = node.x - x;
+    const dz = node.z - z;
+    const d = dx * dx + dz * dz;
+    if (d < bestDist) {
+      bestDist = d;
+      best = node.id;
+    }
+  }
+  return best;
+}
+
+export class World {
+  constructor(scene, rng) {
+    this.scene = scene;
+    this.rng = rng;
+    // Movement colliders: flat AABBs on the ground plane.
+    this.colliders = [];
+    // Meshes the raycaster tests for sight and bullets.
+    this.blockers = [];
+    this.materials = new Map();
+    this.graph = buildWaypointGraph();
+    this.siteRings = {};
+    this.buildLights();
+    this.buildGround();
+    this.buildPerimeter();
+    this.buildWarehouse();
+    this.buildDepot();
+    this.buildContainers();
+    this.buildProps();
+    this.buildSiteMarkers();
+  }
+
+  material(color, roughness = 0.85, metalness = 0.15) {
+    const key = `${color}|${roughness}|${metalness}`;
+    if (!this.materials.has(key)) {
+      this.materials.set(key, new THREE.MeshStandardMaterial({ color, roughness, metalness }));
+    }
+    return this.materials.get(key);
+  }
+
+  // Adds a box mesh plus its collider. `collide` false for low props
+  // the player can step over visually but not walk through.
+  box(x, y, z, w, h, d, color, { collide = true, ry = 0 } = {}) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), this.material(color));
     mesh.position.set(x, y, z);
-    group.add(mesh);
-    meshes.push(mesh);
-    colliders.push(new THREE.Box3().setFromObject(mesh));
+    mesh.rotation.y = ry;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    this.scene.add(mesh);
+    if (collide) {
+      this.colliders.push({ minX: x - w / 2, maxX: x + w / 2, minZ: z - d / 2, maxZ: z + d / 2 });
+      this.blockers.push(mesh);
+    }
+    return mesh;
   }
 
-  // Ground and perimeter walls.
-  addBox([44.4, 0.4, 36.4, 0, -0.2, 0, 'surface']);
-  addBox([0.4, WALL_H, 36.4, -22.2, WALL_H / 2, 0, 'hairline']);
-  addBox([0.4, WALL_H, 36.4, 22.2, WALL_H / 2, 0, 'hairline']);
-  addBox([44.4, WALL_H, 0.4, 0, WALL_H / 2, -18.2, 'hairline']);
-  addBox([44.4, WALL_H, 0.4, 0, WALL_H / 2, 18.2, 'hairline']);
-  // Mid divider wall (z=-6) with two 2 m doors at x=-4..-2 and x=2..4.
-  addBox([18, WALL_H, 0.4, -13, WALL_H / 2, -6, 'hairline']);
-  addBox([4, WALL_H, 0.4, 0, WALL_H / 2, -6, 'hairline']);
-  addBox([18, WALL_H, 0.4, 13, WALL_H / 2, -6, 'hairline']);
-  // Long A corridor wall (x=-10) with a 4 m gap at z=-2..2.
-  addBox([0.4, WALL_H, 12, -10, WALL_H / 2, 8, 'hairline']);
-  addBox([0.4, WALL_H, 4, -10, WALL_H / 2, -4, 'hairline']);
-  // Long B corridor wall (x=10), mirrored.
-  addBox([0.4, WALL_H, 12, 10, WALL_H / 2, 8, 'hairline']);
-  addBox([0.4, WALL_H, 4, 10, WALL_H / 2, -4, 'hairline']);
-  // Site A warehouse shell (open to the south).
-  addBox([8, WALL_H, 0.4, -14, WALL_H / 2, -16, 'hairline']);
-  addBox([0.4, WALL_H, 8, -18, WALL_H / 2, -12, 'hairline']);
-  addBox([0.4, WALL_H, 8, -10, WALL_H / 2, -12, 'hairline']);
-  // Site B depot shell (open to the south).
-  addBox([8, WALL_H, 0.4, 14, WALL_H / 2, -16, 'hairline']);
-  addBox([0.4, WALL_H, 8, 10, WALL_H / 2, -12, 'hairline']);
-  addBox([0.4, WALL_H, 8, 18, WALL_H / 2, -12, 'hairline']);
-  // Containers (cover, rust red).
-  addBox([6, 2.4, 2.4, -4, 1.2, 4, 'rust']);
-  addBox([6, 2.4, 2.4, 4, 1.2, 4, 'rust']);
-  addBox([2.4, 2.4, 6, -6, 1.2, -2, 'rust']);
-  addBox([2.4, 2.4, 6, 6, 1.2, -2, 'rust']);
-  addBox([4, 2.4, 2.4, -16, 1.2, -4, 'rust']);
-  addBox([4, 2.4, 2.4, 16, 1.2, -4, 'rust']);
-  // Crates (cover, hairline).
-  addBox([1.2, 1.2, 1.2, -2, 0.6, 8, 'hairline']);
-  addBox([1.2, 1.2, 1.2, 2, 0.6, 8, 'hairline']);
-  addBox([1.2, 1.2, 1.2, -1.5, 0.6, -1, 'hairline']);
-  addBox([1.2, 1.2, 1.2, 1.5, 0.6, -1, 'hairline']);
-  addBox([1.2, 1.2, 1.2, -12, 0.6, -8, 'hairline']);
-  addBox([1.2, 1.2, 1.2, 12, 0.6, -8, 'hairline']);
-  addBox([1.2, 1.2, 1.2, -16, 0.6, -14, 'hairline']);
-  addBox([1.2, 1.2, 1.2, 16, 0.6, -14, 'hairline']);
-  // Low platforms (0.5 m, jumpable vantage) in front of each site.
-  addBox([4, 0.5, 2, -14, 0.25, -6, 'sand']);
-  addBox([4, 0.5, 2, 14, 0.25, -6, 'sand']);
-
-  // Fuel tanks at site B (cylinders; the collider is their axis-aligned box).
-  const tankMat = material('rust');
-  for (const [x, z] of [[12, -13.5], [16, -13.5]]) {
-    const tank = new THREE.Mesh(new THREE.CylinderGeometry(1.2, 1.2, 2.4, 20), tankMat);
-    tank.position.set(x, 1.2, z);
-    group.add(tank);
-    meshes.push(tank);
-    colliders.push(new THREE.Box3().setFromObject(tank));
+  buildLights() {
+    const scene = this.scene;
+    scene.fog = new THREE.Fog(PALETTE.fog, 55, 130);
+    const sun = new THREE.DirectionalLight(PALETTE.sun, PALETTE.sunIntensity);
+    sun.position.set(-60, 26, -18);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.left = -50;
+    sun.shadow.camera.right = 50;
+    sun.shadow.camera.top = 50;
+    sun.shadow.camera.bottom = -50;
+    scene.add(sun);
+    scene.add(new THREE.HemisphereLight(PALETTE.skyTop, PALETTE.ground, PALETTE.fillIntensity));
+    const ambient = new THREE.AmbientLight(PALETTE.ambient, PALETTE.ambientIntensity);
+    scene.add(ambient);
+    // Two yard lamps throw warm pools over mid and the depot lane.
+    for (const [x, z] of [[-8, 6], [16, -10]]) {
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.16, 7, 8), this.material(PALETTE.pole, 0.6, 0.6));
+      pole.position.set(x, 3.5, z);
+      scene.add(pole);
+      const lamp = new THREE.PointLight(0xffc27a, 18, 22, 1.8);
+      lamp.position.set(x, 6.8, z);
+      scene.add(lamp);
+      const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.22, 8, 8), new THREE.MeshBasicMaterial({ color: 0xffe0a0 }));
+      bulb.position.set(x, 6.8, z);
+      scene.add(bulb);
+    }
   }
 
-  // Barrels (0.9 wide, 1.1 tall) scattered as cover.
-  const barrelMat = material('sand');
-  for (const [x, z] of [[-8, 10], [8, 10], [-4, -10], [4, -10], [-20, 0], [20, 0]]) {
-    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, 1.1, 14), barrelMat);
-    barrel.position.set(x, 0.55, z);
-    group.add(barrel);
-    meshes.push(barrel);
-    colliders.push(new THREE.Box3().setFromObject(barrel));
+  buildGround() {
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(110, 90),
+      new THREE.MeshStandardMaterial({ color: PALETTE.ground, roughness: 1, metalness: 0 }),
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    this.scene.add(ground);
+    // Sand patches break up the yard floor.
+    for (let i = 0; i < 9; i++) {
+      const patch = new THREE.Mesh(
+        new THREE.CircleGeometry(randomIn(this.rng, 3, 7), 20),
+        new THREE.MeshStandardMaterial({ color: PALETTE.sand, roughness: 1, metalness: 0 }),
+      );
+      patch.rotation.x = -Math.PI / 2;
+      patch.position.set(randomIn(this.rng, -36, 36), 0.02, randomIn(this.rng, -26, 26));
+      patch.receiveShadow = true;
+      this.scene.add(patch);
+    }
+    // A worn asphalt strip down the middle lane.
+    const strip = new THREE.Mesh(
+      new THREE.PlaneGeometry(7, 58),
+      new THREE.MeshStandardMaterial({ color: PALETTE.asphalt, roughness: 1, metalness: 0 }),
+    );
+    strip.rotation.x = -Math.PI / 2;
+    strip.position.set(0, 0.015, 0);
+    strip.receiveShadow = true;
+    this.scene.add(strip);
   }
 
-  // Site zones: a glowing floor square so the objective reads at a glance.
-  const sites = {
-    A: { x: -14, z: -12, r: 4 },
-    B: { x: 14, z: -12, r: 4 },
-  };
-  for (const site of Object.values(sites)) {
-    const zone = new THREE.Mesh(new THREE.PlaneGeometry(site.r * 2, site.r * 2), siteMat);
-    zone.rotation.x = -Math.PI / 2;
-    zone.position.set(site.x, 0.02, site.z);
-    group.add(zone);
+  buildPerimeter() {
+    const { minX, maxX, minZ, maxZ, wallHeight } = YARD;
+    const h = wallHeight;
+    this.box(0, h / 2, minZ - 0.5, maxX - minX + 2, h, 1, PALETTE.rustDark);
+    this.box(0, h / 2, maxZ + 0.5, maxX - minX + 2, h, 1, PALETTE.rustDark);
+    this.box(minX - 0.5, h / 2, 0, 1, h, maxZ - minZ + 2, PALETTE.rustDark);
+    this.box(maxX + 0.5, h / 2, 0, 1, h, maxZ - minZ + 2, PALETTE.rustDark);
   }
 
-  // Dusk lighting: a low warm sun from the west, cool blue sky fill, warm
-  // bounce from the south, and a soft eastern fill so no corner of the yard
-  // goes pitch black.
-  const sun = new THREE.DirectionalLight(new THREE.Color(PALETTE.accent), 2.8);
-  sun.position.set(-30, 14, 8);
-  sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
-  sun.shadow.camera.left = -26;
-  sun.shadow.camera.right = 26;
-  sun.shadow.camera.top = 22;
-  sun.shadow.camera.bottom = -22;
-  sun.shadow.camera.far = 80;
-  scene.add(sun);
-  const fill = new THREE.DirectionalLight(new THREE.Color('#7a8ab0'), 0.55);
-  fill.position.set(30, 12, -6);
-  scene.add(fill);
-  const southFill = new THREE.DirectionalLight(new THREE.Color('#8a7a9a'), 0.5);
-  southFill.position.set(0, 10, 30);
-  scene.add(southFill);
-  const hemi = new THREE.HemisphereLight(new THREE.Color('#5a6a8a'), new THREE.Color(PALETTE.surface), 1.25);
-  scene.add(hemi);
-  const warm = new THREE.PointLight(new THREE.Color(PALETTE.accent), 12, 18);
-  warm.position.set(0, 3, -12);
-  scene.add(warm);
+  buildWarehouse() {
+    // Site A: a corrugated warehouse, open on its east side so attackers
+    // push through one wide door and defenders hold the far corners.
+    const wall = PALETTE.warehouseWall;
+    this.box(-34.5, 3, 0, 1, 6, 24, wall);
+    this.box(-27, 3, -11.5, 15, 6, 1, wall);
+    this.box(-27, 3, 11.5, 15, 6, 1, wall);
+    // East wall in two segments leaves a 6-wide door at the middle.
+    this.box(-20.5, 3, -8.5, 1, 6, 7, wall);
+    this.box(-20.5, 3, 8.5, 1, 6, 7, wall);
+    this.box(-20.5, 5.4, 0, 1, 1.2, 10, wall);
+    const roof = new THREE.Mesh(new THREE.BoxGeometry(16, 0.4, 25), this.material(PALETTE.warehouseRoof));
+    roof.position.set(-27, 6.2, 0);
+    roof.castShadow = true;
+    this.scene.add(roof);
+    this.blockers.push(roof);
+    // Crates inside give the defenders cover.
+    this.box(-30, 0.7, -7, 2.4, 1.4, 2.4, PALETTE.crate);
+    this.box(-30, 0.7, 7, 2.4, 1.4, 2.4, PALETTE.crate);
+    this.box(-24, 0.5, -3, 1.8, 1, 1.8, PALETTE.crate);
+  }
 
-  return {
-    group,
-    colliders,
-    meshes,
-    sites,
-    attackerSpawns: [
-      { x: 0, z: 14 }, { x: -3, z: 15 }, { x: 3, z: 15 }, { x: -6, z: 13 },
-    ],
-    defenderSpawns: [
-      { x: -14, z: -10, site: 'A' }, { x: -10, z: -14, site: 'A' },
-      { x: 14, z: -10, site: 'B' }, { x: 10, z: -14, site: 'B' },
-    ],
-    // Waypoint graph for bot navigation: id -> {x, z, links}.
-    waypoints: {
-      spawn: { x: 0, z: 14, links: ['s1', 's2', 'mid1'] },
-      s1: { x: -8, z: 12, links: ['spawn', 'longA1', 'mid1'] },
-      s2: { x: 8, z: 12, links: ['spawn', 'longB1', 'mid1'] },
-      mid1: { x: 0, z: 8, links: ['spawn', 's1', 's2', 'mid2'] },
-      mid2: { x: 0, z: 2, links: ['mid1', 'mid3', 'coverW', 'coverE', 'longA2', 'longB2'] },
-      mid3: { x: 0, z: -2, links: ['mid2', 'doorW', 'doorE'] },
-      doorW: { x: -3, z: -6, links: ['mid3', 'siteA2', 'longA3'] },
-      doorE: { x: 3, z: -6, links: ['mid3', 'siteB2', 'longB3'] },
-      coverW: { x: -6, z: 2, links: ['mid2', 'longA2'] },
-      coverE: { x: 6, z: 2, links: ['mid2', 'longB2'] },
-      longA1: { x: -16, z: 8, links: ['s1', 'longA2'] },
-      longA2: { x: -16, z: 0, links: ['longA1', 'longA3', 'coverW', 'mid2'] },
-      longA3: { x: -14, z: -8, links: ['longA2', 'siteA', 'doorW'] },
-      longB1: { x: 16, z: 8, links: ['s2', 'longB2'] },
-      longB2: { x: 16, z: 0, links: ['longB1', 'longB3', 'coverE', 'mid2'] },
-      longB3: { x: 14, z: -8, links: ['longB2', 'siteB', 'doorE'] },
-      siteA: { x: -14, z: -12, links: ['longA3', 'siteA2', 'backA'] },
-      siteA2: { x: -8, z: -10, links: ['siteA', 'doorW'] },
-      siteB: { x: 14, z: -12, links: ['longB2', 'siteB2', 'backB'] },
-      siteB2: { x: 8, z: -10, links: ['siteB', 'doorE'] },
-      backA: { x: -18, z: -14, links: ['siteA'] },
-      backB: { x: 18, z: -14, links: ['siteB'] },
-    },
-  };
+  buildDepot() {
+    // Site B: three fuel tanks ringed by low pipework and a fence gap.
+    for (const [x, z, r] of [[30, -6, 3.2], [34, 6, 2.6], [26, 9, 2.2]]) {
+      const tank = new THREE.Mesh(new THREE.CylinderGeometry(r, r, 5, 20), this.material(PALETTE.tankWhite, 0.5, 0.4));
+      tank.position.set(x, 2.5, z);
+      tank.castShadow = true;
+      tank.receiveShadow = true;
+      this.scene.add(tank);
+      this.blockers.push(tank);
+      this.colliders.push({ minX: x - r, maxX: x + r, minZ: z - r, maxZ: z + r });
+      const cap = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.4, r, 0.8, 20), this.material(PALETTE.tankRust, 0.6, 0.4));
+      cap.position.set(x, 5.4, z);
+      this.scene.add(cap);
+    }
+    this.box(24, 0.4, 10, 8, 0.8, 0.8, PALETTE.barrel);
+    this.box(36, 0.4, -2, 0.8, 0.8, 8, PALETTE.barrel);
+  }
+
+  buildContainers() {
+    // Container stacks shape the three lanes: a high stack mid, low
+    // cover on the flanks, and a corner that breaks the long sightline.
+    const specs = [
+      [-12, 6, 6, 2.4, 2.6, PALETTE.rustLight, 0],
+      [-12, 10, 6, 2.4, 2.6, PALETTE.containerTeal, 0],
+      [-12, 8.6, -6, 2.4, 2.6, PALETTE.containerOchre, 0],
+      [12, 6, 6, 2.4, 2.6, PALETTE.containerSlate, 0],
+      [12, 10, -6, 2.4, 2.6, PALETTE.rustMid, 0],
+      [12, -10, 6, 2.4, 2.6, PALETTE.containerTeal, 0],
+      [-6, -14, 6, 2.4, 2.6, PALETTE.rustDark, 0],
+      [6, -18, 6, 2.4, 2.6, PALETTE.containerOchre, 0],
+      [-18, -16, 6, 2.4, 2.6, PALETTE.rustLight, 0],
+      [18, 16, 6, 2.4, 2.6, PALETTE.containerSlate, 0],
+      [-28, 20, 6, 2.4, 2.6, PALETTE.rustMid, 0],
+      [28, -18, 6, 2.4, 2.6, PALETTE.rustDark, 0],
+    ];
+    for (const [x, z, w, h, d, color, ry] of specs) {
+      this.box(x, h / 2, z, w, h, d, color, { ry });
+    }
+    // One double stack guards mid.
+    this.box(0, 1.3, -4, 6, 2.6, 2.4, PALETTE.rustLight);
+    this.box(0, 3.9, -4, 6, 2.6, 2.4, PALETTE.containerTeal);
+  }
+
+  buildProps() {
+    // Barrels and crates scattered as micro-cover.
+    const spots = [
+      [-8, 18, 'barrel'], [8, 18, 'barrel'], [-16, 2, 'crate'], [16, 2, 'crate'],
+      [-4, -8, 'barrel'], [4, -8, 'barrel'], [-24, 14, 'crate'], [24, -14, 'crate'],
+    ];
+    for (const [x, z, kind] of spots) {
+      if (kind === 'barrel') {
+        const mesh = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.7, 1.4, 12), this.material(PALETTE.barrel, 0.7, 0.3));
+        mesh.position.set(x, 0.7, z);
+        mesh.castShadow = true;
+        this.scene.add(mesh);
+        this.blockers.push(mesh);
+        this.colliders.push({ minX: x - 0.7, maxX: x + 0.7, minZ: z - 0.7, maxZ: z + 0.7 });
+      } else {
+        this.box(x, 0.6, z, 1.6, 1.2, 1.6, PALETTE.crate);
+      }
+    }
+  }
+
+  buildSiteMarkers() {
+    // Glowing floor rings mark the two plant zones.
+    for (const site of Object.values(SITES)) {
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(site.radius - 0.4, site.radius, 40),
+        new THREE.MeshBasicMaterial({ color: site.color, transparent: true, opacity: 0.75, side: THREE.DoubleSide }),
+      );
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.set(site.center.x, 0.05, site.center.z);
+      this.scene.add(ring);
+      const disc = new THREE.Mesh(
+        new THREE.CircleGeometry(site.radius - 0.4, 40),
+        new THREE.MeshBasicMaterial({ color: site.color, transparent: true, opacity: 0.12, side: THREE.DoubleSide }),
+      );
+      disc.rotation.x = -Math.PI / 2;
+      disc.position.set(site.center.x, 0.04, site.center.z);
+      this.scene.add(disc);
+      const glow = new THREE.PointLight(site.color, 10, 18, 1.8);
+      glow.position.set(site.center.x, 3, site.center.z);
+      this.scene.add(glow);
+      this.siteRings[site.id] = ring;
+    }
+  }
+
+  // Circle-vs-AABB collision: push `pos` (x,z) out of any collider it
+  // overlaps, then clamp to the yard. Returns true when a push happened.
+  collideCircle(pos, radius) {
+    let hit = false;
+    for (const c of this.colliders) {
+      const nearestX = Math.max(c.minX, Math.min(pos.x, c.maxX));
+      const nearestZ = Math.max(c.minZ, Math.min(pos.z, c.maxZ));
+      const dx = pos.x - nearestX;
+      const dz = pos.z - nearestZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < radius * radius) {
+        hit = true;
+        if (d2 > 0.0001) {
+          const d = Math.sqrt(d2);
+          pos.x = nearestX + (dx / d) * radius;
+          pos.z = nearestZ + (dz / d) * radius;
+        } else {
+          // Dead centre inside a box: push out along the smallest axis.
+          const pushLeft = pos.x - c.minX;
+          const pushRight = c.maxX - pos.x;
+          const pushBack = pos.z - c.minZ;
+          const pushFront = c.maxZ - pos.z;
+          const smallest = Math.min(pushLeft, pushRight, pushBack, pushFront);
+          if (smallest === pushLeft) pos.x = c.minX - radius;
+          else if (smallest === pushRight) pos.x = c.maxX + radius;
+          else if (smallest === pushBack) pos.z = c.minZ - radius;
+          else pos.z = c.maxZ + radius;
+        }
+      }
+    }
+    pos.x = Math.max(YARD.minX + radius, Math.min(YARD.maxX - radius, pos.x));
+    pos.z = Math.max(YARD.minZ + radius, Math.min(YARD.maxZ - radius, pos.z));
+    return hit;
+  }
+
+  insideSite(siteId, x, z) {
+    const site = SITES[siteId];
+    const dx = x - site.center.x;
+    const dz = z - site.center.z;
+    return dx * dx + dz * dz <= site.radius * site.radius;
+  }
 }

@@ -1,132 +1,114 @@
-// Player movement: acceleration, friction, gravity, crouch and jump. The
-// player is a box resolved against the world's colliders one axis at a time,
-// so a wall never swallows the player and sliding along it still works.
-
+// The player: first-person movement with acceleration, crouching
+// and AABB collision, plus health and armor. The camera sits at eye
+// height; the body is a capsule the bots and bullets test against.
 import * as THREE from 'three';
+import { clamp, lerp } from './util.js';
+import { ARMOR_REDUCTION } from './weapons.js';
 
-const RADIUS = 0.34;
-const STAND_HEIGHT = 1.72;
-const CROUCH_HEIGHT = 1.12;
-const STAND_EYE = 1.6;
-const CROUCH_EYE = 1.02;
-const WALK_SPEED = 5.2;
-const CROUCH_SPEED = 2.4;
-const GROUND_ACCEL = 42;
-const AIR_ACCEL = 9;
-const FRICTION = 9;
-const GRAVITY = 20;
-const JUMP_SPEED = 6.2;
+export const EYE_STAND = 1.62;
+export const EYE_CROUCH = 1.05;
+export const BODY_RADIUS = 0.42;
+export const WALK_SPEED = 5.2;
+export const CROUCH_SPEED = 2.6;
+export const AIM_SPEED = 3.4;
 
-export function createPlayer(colliders) {
-  const player = {
-    position: new THREE.Vector3(0, 0, 9.5),
-    velocity: new THREE.Vector3(),
-    yaw: 0,
-    pitch: 0,
-    eye: STAND_EYE,
-    onGround: true,
-    crouching: false,
-    height: STAND_HEIGHT,
-  };
-  const probe = new THREE.Box3();
-  const wish = new THREE.Vector3();
-
-  // Does a player box at (x, y, z) with this height overlap any collider?
-  // `lift` trims the bottom and top of the test box, so standing on the floor
-  // is not read as walking into a wall.
-  function overlaps(x, y, z, height, lift) {
-    probe.min.set(x - RADIUS, y + lift, z - RADIUS);
-    probe.max.set(x + RADIUS, y + height - lift, z + RADIUS);
-    for (const collider of colliders) {
-      if (probe.intersectsBox(collider)) return collider;
-    }
-    return null;
+export class Player {
+  constructor(world, spawn, team) {
+    this.world = world;
+    this.team = team;
+    this.pos = new THREE.Vector3(spawn.x, 0, spawn.z);
+    this.vel = new THREE.Vector3();
+    this.yaw = team === 'vanguard' ? 0 : Math.PI;
+    this.pitch = 0;
+    this.health = 100;
+    this.armor = 0;
+    this.alive = true;
+    this.crouching = false;
+    this.eyeHeight = EYE_STAND;
+    this.moving = false;
+    this.airborne = false;
+    this.onGround = true;
+    // Weapon slots: index 0 is the current weapon.
+    this.slots = [];
+    this.currentSlot = 0;
+    this.heat = 0;
+    this.lastShotAt = -10;
+    this.reloadUntil = -1;
+    this.aiming = false;
   }
 
-  function look(dx, dy, sensitivity = 0.0022) {
-    player.yaw -= dx * sensitivity;
-    player.pitch = Math.max(-1.45, Math.min(1.45, player.pitch - dy * sensitivity));
+  get eyeY() {
+    return this.eyeHeight;
   }
 
-  function recoil(pitchKick, yawKick) {
-    player.pitch = Math.min(1.45, player.pitch + pitchKick);
-    player.yaw += yawKick;
+  get currentWeapon() {
+    return this.slots[this.currentSlot] ?? null;
   }
 
-  function step(dt, keys) {
-    // Crouch: shrink while held; stand back up only when the head is clear.
-    const wantCrouch = keys.has('ControlLeft') || keys.has('ControlRight') || keys.has('KeyC');
-    if (wantCrouch && !player.crouching) {
-      player.crouching = true;
-      player.height = CROUCH_HEIGHT;
-    } else if (!wantCrouch && player.crouching && !overlaps(player.position.x, player.position.y, player.position.z, STAND_HEIGHT, 0.02)) {
-      player.crouching = false;
-      player.height = STAND_HEIGHT;
-    }
-    const eyeTarget = player.crouching ? CROUCH_EYE : STAND_EYE;
-    player.eye += (eyeTarget - player.eye) * Math.min(1, dt * 12);
-
-    // Wish direction from WASD, in world space from the yaw.
-    const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
-    const strafe = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
-    wish.set(0, 0, 0);
-    if (forward || strafe) {
-      const sin = Math.sin(player.yaw);
-      const cos = Math.cos(player.yaw);
-      wish.set(-sin * forward + cos * strafe, 0, -cos * forward - sin * strafe).normalize();
-    }
-
-    const speed = player.crouching ? CROUCH_SPEED : WALK_SPEED;
-    const accel = player.onGround ? GROUND_ACCEL : AIR_ACCEL;
-    const blend = Math.min(1, (accel * dt) / speed);
-    player.velocity.x += (wish.x * speed - player.velocity.x) * blend;
-    player.velocity.z += (wish.z * speed - player.velocity.z) * blend;
-    if (player.onGround && !wish.lengthSq()) {
-      const damp = Math.max(0, 1 - FRICTION * dt);
-      player.velocity.x *= damp;
-      player.velocity.z *= damp;
-    }
-
-    if (keys.has('Space') && player.onGround) {
-      player.velocity.y = JUMP_SPEED;
-      player.onGround = false;
-    }
-    player.velocity.y -= GRAVITY * dt;
-
-    // Move one axis at a time; a blocked axis stops and zeroes that velocity.
-    const nextX = player.position.x + player.velocity.x * dt;
-    if (!overlaps(nextX, player.position.y, player.position.z, player.height, 0.04)) player.position.x = nextX;
-    else player.velocity.x = 0;
-    const nextZ = player.position.z + player.velocity.z * dt;
-    if (!overlaps(player.position.x, player.position.y, nextZ, player.height, 0.04)) player.position.z = nextZ;
-    else player.velocity.z = 0;
-
-    player.position.y += player.velocity.y * dt;
-    player.onGround = false;
-    const hit = overlaps(player.position.x, player.position.y, player.position.z, player.height, 0);
-    if (hit && player.velocity.y <= 0) {
-      player.position.y = hit.max.y;
-      player.velocity.y = 0;
-      player.onGround = true;
-    } else if (hit) {
-      player.position.y = hit.min.y - player.height;
-      player.velocity.y = 0;
-    }
-    if (player.position.y < 0) {
-      player.position.y = 0;
-      player.velocity.y = 0;
-      player.onGround = true;
-    }
-    player.velocity.y = Math.max(-30, player.velocity.y);
+  // One fixed simulation step. `move` is {x, z} in camera space,
+  // already normalised; `dt` is the fixed step.
+  step(move, dt, wantCrouch) {
+    if (!this.alive) return;
+    this.crouching = wantCrouch;
+    const targetEye = wantCrouch ? EYE_CROUCH : EYE_STAND;
+    this.eyeHeight = lerp(this.eyeHeight, targetEye, Math.min(1, dt * 12));
+    const speed = wantCrouch ? CROUCH_SPEED : this.aiming ? AIM_SPEED : WALK_SPEED;
+    const sin = Math.sin(this.yaw);
+    const cos = Math.cos(this.yaw);
+    // Forward is (-sin yaw, 0, -cos yaw); right is (cos yaw, 0, -sin yaw).
+    const wishX = -sin * move.z + cos * move.x;
+    const wishZ = -cos * move.z - sin * move.x;
+    const rate = Math.min(1, (this.onGround ? 14 : 4) * dt);
+    this.vel.x = lerp(this.vel.x, wishX * speed, rate);
+    this.vel.z = lerp(this.vel.z, wishZ * speed, rate);
+    this.pos.x += this.vel.x * dt;
+    this.pos.z += this.vel.z * dt;
+    this.world.collideCircle(this.pos, BODY_RADIUS);
+    const speedNow = Math.hypot(this.vel.x, this.vel.z);
+    this.moving = speedNow > 0.6;
+    this.heat = Math.max(0, this.heat - dt * 2.2);
   }
 
-  return {
-    state: player,
-    step,
-    look,
-    recoil,
-    groundSpeed() {
-      return Math.hypot(player.velocity.x, player.velocity.z);
-    },
-  };
+  look(dx, dy, sensitivity = 0.0022) {
+    this.yaw -= dx * sensitivity;
+    this.pitch = clamp(this.pitch - dy * sensitivity, -1.5, 1.5);
+  }
+
+  // Damage after armor: kevlar halves what gets through.
+  takeDamage(amount) {
+    if (!this.alive) return 0;
+    const taken = this.armor > 0 ? amount * ARMOR_REDUCTION : amount;
+    if (this.armor > 0) this.armor = Math.max(0, this.armor - amount * 0.5);
+    this.health -= taken;
+    if (this.health <= 0) {
+      this.health = 0;
+      this.alive = false;
+    }
+    return taken;
+  }
+
+  healFull() {
+    this.health = 100;
+    this.alive = true;
+    this.vel.set(0, 0, 0);
+    this.heat = 0;
+    this.reloadUntil = -1;
+  }
+
+  respawn(spawn) {
+    this.pos.set(spawn.x, 0, spawn.z);
+    this.yaw = this.team === 'vanguard' ? 0 : Math.PI;
+    this.pitch = 0;
+    this.healFull();
+  }
+
+  eyePosition(out) {
+    out.set(this.pos.x, this.eyeY, this.pos.z);
+    return out;
+  }
+
+  forward(out) {
+    out.set(-Math.sin(this.yaw) * Math.cos(this.pitch), Math.sin(this.pitch), -Math.cos(this.yaw) * Math.cos(this.pitch));
+    return out;
+  }
 }

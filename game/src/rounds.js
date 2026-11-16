@@ -1,82 +1,79 @@
-// Rounds and the match. This module owns the clock and the score and nothing
-// else: buy phase, live round, end banner, first to 5 rounds (at most 9).
-// main.js owns what happens on each event — spawning, money, the banner —
-// and calls into here. A round ends by elimination, by the bomb, by a defuse,
-// or by the clock running out with no plant.
-
+// The round and match state machine. A match is first to five
+// rounds, at most nine. Each round opens with a 15-second buy phase,
+// then 100 seconds of live play. The machine owns the phase, the
+// clock and the score, and reports round ends as events the game
+// loop turns into banners, payouts and resets.
 export const BUY_TIME = 15;
 export const ROUND_TIME = 100;
-export const END_TIME = 5;
 export const WIN_ROUNDS = 5;
 export const MAX_ROUNDS = 9;
 
-export function createRounds() {
-  const state = {
-    phase: 'menu', // menu | buy | live | end | matchEnd
-    round: 0,
-    scoreV: 0,
-    scoreE: 0,
-    timer: 0,
-    reason: '',
-    winner: null,
-    matchWinner: null,
-  };
+export class Match {
+  constructor() {
+    this.round = 1;
+    this.score = { vanguard: 0, ember: 0 };
+    this.phase = 'menu'; // menu | buy | live | over
+    this.clock = BUY_TIME;
+    this.lastWinner = null;
+    this.lastReason = '';
+    this.matchWinner = null;
+    this.bannerUntil = 0;
+  }
 
-  return {
-    state,
+  startMatch() {
+    this.round = 1;
+    this.score = { vanguard: 0, ember: 0 };
+    this.matchWinner = null;
+    this.startRound();
+  }
 
-    startMatch() {
-      state.phase = 'buy';
-      state.round = 0;
-      state.scoreV = 0;
-      state.scoreE = 0;
-      state.timer = BUY_TIME;
-      state.reason = '';
-      state.winner = null;
-      state.matchWinner = null;
-    },
+  startRound() {
+    this.phase = 'buy';
+    this.clock = BUY_TIME;
+    this.lastWinner = null;
+    this.lastReason = '';
+  }
 
-    startRound() {
-      state.round += 1;
-      state.phase = 'buy';
-      state.timer = BUY_TIME;
-      state.reason = '';
-      state.winner = null;
-    },
+  startLive() {
+    this.phase = 'live';
+    this.clock = ROUND_TIME;
+  }
 
-    beginLive() {
-      state.phase = 'live';
-      state.timer = ROUND_TIME;
-    },
+  // Returns 'timeout' when the live clock runs out, else null.
+  tick(dt) {
+    if (this.phase !== 'buy' && this.phase !== 'live') return null;
+    this.clock -= dt;
+    if (this.phase === 'buy' && this.clock <= 0) {
+      this.startLive();
+      return 'live';
+    }
+    if (this.phase === 'live' && this.clock <= 0) return 'timeout';
+    return null;
+  }
 
-    // Returns false if the round was already over, so a second end condition
-    // firing in the same frame cannot double-count the score.
-    endRound(winner, reason) {
-      if (state.phase === 'end' || state.phase === 'matchEnd') return false;
-      state.phase = 'end';
-      state.timer = END_TIME;
-      state.winner = winner;
-      state.reason = reason;
-      if (winner === 'VANGUARD') state.scoreV += 1;
-      else state.scoreE += 1;
-      return true;
-    },
+  // Close a round: record the win, check the match, freeze play.
+  endRound(winner, reason, now) {
+    this.score[winner] += 1;
+    this.lastWinner = winner;
+    this.lastReason = reason;
+    this.phase = 'over';
+    this.bannerUntil = now + 4;
+    if (this.score[winner] >= WIN_ROUNDS || this.round >= MAX_ROUNDS) {
+      this.matchWinner = this.score.vanguard > this.score.ember ? 'vanguard' : 'ember';
+    }
+    return this.matchWinner;
+  }
 
-    endMatch() {
-      state.phase = 'matchEnd';
-      state.matchWinner = state.scoreV > state.scoreE ? 'VANGUARD' : 'EMBER';
-      state.timer = 0;
-    },
+  nextRound() {
+    this.round += 1;
+    this.startRound();
+  }
 
-    matchOver() {
-      return state.scoreV >= WIN_ROUNDS || state.scoreE >= WIN_ROUNDS || state.round >= MAX_ROUNDS;
-    },
+  get over() {
+    return this.matchWinner !== null;
+  }
 
-    step(dt) {
-      if (state.phase === 'buy' || state.phase === 'live' || state.phase === 'end') {
-        state.timer -= dt;
-      }
-      return state.timer;
-    },
-  };
+  scoreText() {
+    return `${this.score.vanguard} — ${this.score.ember}`;
+  }
 }

@@ -1,23 +1,62 @@
-// The look plan, in one place. A freight yard at dusk: warm low sun, cool
-// blue shadows, rust and sand. The same names are the CSS custom properties
-// in index.html. Team colours are the only additions: VANGUARD blue,
-// EMBER red. Everything that draws — the map, the bots, the HUD — reads
-// from this one object, so a palette change is a one-line change.
-
+// DUSTLINE's dusk palette. One place holds every colour the map,
+// the HUD and the tracers use, so the whole game reads as one scene:
+// a warm low sun from the west against cool blue shadow fill.
 export const PALETTE = {
-  canvas: '#191410', // sky and fog
-  surface: '#2b2118', // ground, big walls
-  hairline: '#4d3d2a', // crates, containers, cover
-  ink: '#f2e8d5', // light surfaces, HUD text
-  muted: '#a89880', // dim text, distant detail
-  accent: '#ff8c2f', // the sun, muzzle flashes, highlights
-  rust: '#8a4a28', // containers, barrels
-  sand: '#c9a86a', // ground patches, site markers
-  teamBlue: '#4a90d9', // VANGUARD (attackers, the player's team)
-  teamRed: '#e8532f', // EMBER (defenders)
+  // Sky and light.
+  skyTop: 0x2e3a5e,
+  skyHorizon: 0xe08a4e,
+  fog: 0x3a3348,
+  sun: 0xffb066,
+  sunIntensity: 2.8,
+  fill: 0x5a6fa8,
+  fillIntensity: 0.7,
+  ambient: 0x8a7a9a,
+  ambientIntensity: 0.5,
+  // Ground and structures.
+  ground: 0x6b5a44,
+  sand: 0xa88a5e,
+  asphalt: 0x4a4640,
+  rustLight: 0xa8542e,
+  rustMid: 0x8a4526,
+  rustDark: 0x5e3220,
+  containerTeal: 0x3e6b62,
+  containerOchre: 0xb07a2e,
+  containerSlate: 0x54606a,
+  warehouseWall: 0x7a6a58,
+  warehouseRoof: 0x4e4438,
+  tankWhite: 0x9a938a,
+  tankRust: 0x7a4a28,
+  crate: 0x8a6a42,
+  barrel: 0x6a3a2a,
+  pole: 0x3a3a3e,
+  // Bomb sites.
+  siteA: 0xffc46a,
+  siteB: 0x6ad2ff,
+  siteGlow: 0xff9a3e,
+  // Teams and markers.
+  vanguard: 0x4ea3ff,
+  ember: 0xff7a3e,
+  tracer: 0xffd27a,
+  muzzle: 0xffc46a,
+  // HUD.
+  hudGreen: '#7dff8a',
+  hudAmber: '#ffc46a',
+  hudRed: '#ff5a4e',
+  hudWhite: '#f2ede4',
+  hudDim: '#b8b0a4',
 };
 
-// A named colour, as a string the three.js materials and the CSS both take.
-export function shade(name) {
-  return PALETTE[name];
-}
+export const TEAM = {
+  VANGUARD: 'vanguard',
+  EMBER: 'ember',
+};
+
+export const TEAM_LABEL = {
+  vanguard: 'VANGUARD',
+  ember: 'EMBER',
+};
+
+export const TEAM_COLOR = {
+  vanguard: PALETTE.vanguard,
+  ember: PALETTE.ember,
+};

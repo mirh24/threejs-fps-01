@@ -1,825 +1,785 @@
-// Boot and the one loop: a fixed 60 Hz simulation feeding a render at the
-// display's rate. DUSTLINE is a round-based tactical FPS: VANGUARD (the
-// player + 3 bots) attacks, EMBER (4 bots) defends two bomb sites. Win a
-// round by elimination, by planting the bomb and letting it blow, or by
-// stopping the plant. Money between rounds buys weapons, grenades and armor.
-//
-// ?shot=start|play|buy|end with &seed=N sets up a deterministic frame for a
-// capture, renders it twice, then freezes it and sets window.__shotReady.
-
+// DUSTLINE boot, game loop, shooting, grenades and round flow.
+// The simulation runs at a fixed 60 Hz step, apart from rendering,
+// and all state lives in the one `game` object below. Bots, the bomb
+// and the match machine are modules; this file wires them together.
 import * as THREE from 'three';
-import { PALETTE } from './palette.js';
-import { createWorld } from './world.js';
-import { createInput } from './input.js';
-import { createPlayer } from './player.js';
-import { createWeapons, WEAPONS, GRENADE_PRICE, ARMOR_PRICE } from './weapons.js';
-import { createBotManager } from './bots.js';
-import { createBomb, PLANT_TIME, BOMB_TIMER } from './bomb.js';
-import { createEconomy, KILL_REWARD, PLANT_REWARD } from './economy.js';
-import { createRounds, BUY_TIME, ROUND_TIME, END_TIME, WIN_ROUNDS, MAX_ROUNDS } from './rounds.js';
-import { createHud } from './hud.js';
-import { createAudio } from './audio.js';
-import { clamp, mulberry32 } from './util.js';
+import { clamp, lerp, mulberry32, dist2DSq } from './util.js';
+import { PALETTE, TEAM_LABEL } from './palette.js';
+import { AudioSys } from './audio.js';
+import { WEAPONS, makeSlot, spreadFor, damageAtRange, makeViewModel, MuzzleFlash, GRENADE } from './weapons.js';
+import { World, SPAWNS } from './world.js';
+import { Player } from './player.js';
+import { Economy } from './economy.js';
+import { Bomb } from './bomb.js';
+import { Match } from './rounds.js';
+import { Bot } from './bots.js';
+import { Input } from './input.js';
+import { Hud } from './hud.js';
 
-const FIXED_STEP = 1 / 60;
-const FOV = 74;
+const STEP = 1 / 60;
 const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seed = Number(params.get('seed') || 1);
+const SHOT = params.get('shot');
+const SEED = parseInt(params.get('seed') ?? '1', 10) || 1;
+const rng = mulberry32(SEED);
 
-const canvas = document.getElementById('game');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
-
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(PALETTE.canvas);
-scene.fog = new THREE.Fog(new THREE.Color(PALETTE.canvas), 26, 62);
-
-const camera = new THREE.PerspectiveCamera(FOV, 1, 0.05, 120);
-camera.rotation.order = 'YXZ';
-scene.add(camera);
-
-// The modules, each with one job.
-const world = createWorld(scene);
-const audio = createAudio();
-const hud = createHud();
-const economy = createEconomy();
-const rounds = createRounds();
-const bomb = createBomb(scene);
-const player = createPlayer(world.colliders);
-const weapons = createWeapons(camera);
-const input = createInput(canvas, (locked) => {
-  if (!locked && rounds.state.phase !== 'menu' && !shot) hud.showOverlay('paused');
-});
-
-// The player as an enemy for bots: a live reference to the player state.
-const playerProxy = { isPlayer: true, alive: true, pos: player.state.position, name: 'YOU' };
-
-// Raycasting: world meshes block sight and stop bullets; bot bodies stop
-// bullets too. shootables is the list both rays test against.
-const shootables = [...world.meshes];
-const raycaster = new THREE.Raycaster();
-raycaster.far = 90;
-const tmpDir = new THREE.Vector3();
-const tmpFrom = new THREE.Vector3();
-
-function shootRay(from, dir, maxDist) {
-  raycaster.set(from, dir);
-  raycaster.far = maxDist;
-  const hits = raycaster.intersectObjects(shootables, false);
-  if (hits.length === 0) return null;
-  const hit = hits[0];
-  return {
-    point: hit.point.clone(),
-    distance: hit.distance,
-    object: hit.object,
-    botName: hit.object.userData.botName || null,
-    objectName: hit.object.name || '',
-  };
-}
-
-function hasLineOfSight(from, to) {
-  const dir = to.clone().sub(from);
-  const dist = dir.length();
-  if (dist < 0.01) return true;
-  dir.normalize();
-  raycaster.set(from, dir);
-  raycaster.far = dist - 0.05;
-  return raycaster.intersectObjects(world.meshes, false).length === 0;
-}
-
-function botByName(name) {
-  return bots.bots.find((b) => b.name === name) || null;
-}
-
-// Tracers and impact puffs, pooled so firing never allocates.
-const tracers = [];
-for (let i = 0; i < 12; i += 1) {
-  const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
-  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: new THREE.Color(PALETTE.accent), transparent: true, opacity: 0 }));
-  line.visible = false;
-  scene.add(line);
-  tracers.push({ line, life: 0 });
-}
-let tracerIndex = 0;
-function spawnTracer(from, to) {
-  const t = tracers[tracerIndex];
-  tracerIndex = (tracerIndex + 1) % tracers.length;
-  t.line.geometry.setFromPoints([from, to]);
-  t.line.material.opacity = 0.85;
-  t.line.visible = true;
-  t.life = 0.07;
-}
-const puffs = [];
-for (let i = 0; i < 10; i += 1) {
-  const mesh = new THREE.Mesh(
-    new THREE.SphereGeometry(0.09, 8, 6),
-    new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.sand), transparent: true, opacity: 0 }),
-  );
-  mesh.visible = false;
-  scene.add(mesh);
-  puffs.push({ mesh, life: 0 });
-}
-let puffIndex = 0;
-function spawnPuff(point) {
-  const p = puffs[puffIndex];
-  puffIndex = (puffIndex + 1) % puffs.length;
-  p.mesh.position.copy(point);
-  p.mesh.scale.setScalar(1);
-  p.mesh.material.opacity = 0.8;
-  p.mesh.visible = true;
-  p.life = 0.3;
-}
-
-// Grenades and explosions.
-const grenades = [];
-const grenadeGeo = new THREE.SphereGeometry(0.09, 10, 8);
-const grenadeMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.teamRed), roughness: 0.5, metalness: 0.4 });
-function throwGrenade(from, dir) {
-  const mesh = new THREE.Mesh(grenadeGeo, grenadeMat);
-  mesh.position.copy(from);
-  scene.add(mesh);
-  grenades.push({ mesh, vel: dir.clone().multiplyScalar(16).add(new THREE.Vector3(0, 5.5, 0)), fuse: 1.6, fromPlayer: true });
-  audio.grenadeThrow();
-  weapons.state.grenades -= 1;
-}
-const explosionLight = new THREE.PointLight(new THREE.Color(PALETTE.accent), 0, 26);
-scene.add(explosionLight);
-const explosionMesh = new THREE.Mesh(
-  new THREE.SphereGeometry(1, 20, 14),
-  new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.accent), transparent: true, opacity: 0 }),
-);
-explosionMesh.visible = false;
-scene.add(explosionMesh);
-let explosionLife = 0;
-let shake = 0;
-
-function explode(pos, radius, maxDamage, source) {
-  explosionMesh.position.copy(pos);
-  explosionMesh.visible = true;
-  explosionLife = 0.5;
-  explosionLight.position.copy(pos);
-  explosionLight.intensity = 60;
-  audio.explosion();
-  shake = Math.max(shake, 0.6);
-  const victims = [...bots.bots, playerProxy];
-  for (const victim of victims) {
-    if (!victim.alive) continue;
-    const d = Math.hypot(victim.pos.x - pos.x, victim.pos.z - pos.z);
-    if (d > radius) continue;
-    const damage = Math.round(maxDamage * (1 - (d / radius) * 0.75));
-    const self = source === victim;
-    applyDamage(victim, self ? Math.round(damage * 0.3) : damage, false, source, 'HE');
-  }
-}
-
-// The one damage entry point: the player, bots and explosions all come here.
-function applyDamage(target, damage, headshot, attacker, weaponName) {
-  if (!target.alive) return;
-  if (target.isPlayer) {
-    const final = weapons.state.armor ? Math.round(damage * 0.5) : damage;
-    playerHealth -= final;
-    audio.hurt();
-    if (attacker && !attacker.isPlayer) {
-      const dx = attacker.pos.x - player.state.position.x;
-      const dz = attacker.pos.z - player.state.position.z;
-      const worldAngle = Math.atan2(dx, dz);
-      const rel = worldAngle - player.state.yaw;
-      hud.damageFrom((rel * 180) / Math.PI);
-    }
-    if (playerHealth <= 0) {
-      playerHealth = 0;
-      playerDies(attacker, weaponName, headshot);
-    }
-    return;
-  }
-  target.health -= damage;
-  if (target.health <= 0) {
-    target.health = 0;
-    bots.kill(target);
-    const attackerName = attacker && attacker.isPlayer ? 'YOU' : attacker ? attacker.name : '—';
-    hud.addKill(attackerName, weaponName || target.weapon.name, target.name, headshot);
-    if (attacker && attacker.isPlayer) {
-      economy.add(KILL_REWARD);
-      audio.kill();
-    }
-    if (target.carriesBomb) {
-      bomb.dropAt(target.pos.clone());
-      bots.dropBomb(target);
-    }
-    checkRoundEnd();
-  }
-}
-
-// Bots: creation, perception and shooting callbacks live here, in the ctx the
-// bot manager was built with.
-const botCtx = {
-  seed,
-  get now() {
-    return now;
-  },
-  get playerSpeed() {
-    return player.groundSpeed();
-  },
-  registerShootable(mesh) {
-    shootables.push(mesh);
-  },
-  unregisterShootable(mesh) {
-    const i = shootables.indexOf(mesh);
-    if (i >= 0) shootables.splice(i, 1);
-  },
-  hasLineOfSight,
-  raycast: shootRay,
-  onDamage(target, damage, headshot, attacker) {
-    applyDamage(target, damage, headshot, attacker, attacker ? attacker.weapon.name : 'AR-77');
-  },
-  onBotShot(bot, muzzle, dir, dist) {
-    spawnTracer(muzzle, muzzle.clone().add(dir.clone().multiplyScalar(Math.min(dist + 8, 40))));
-    if (dist < 30) audio.enemyShot(dist);
-    botCtx.hearNoiseFor(bot, muzzle);
-  },
-  hearNoiseFor(bot, pos) {
-    bots.hearNoise(pos, bot.team);
-  },
-  onStep(pos, speed) {
-    const d = Math.hypot(pos.x - player.state.position.x, pos.z - player.state.position.z);
-    if (d < 12) audio.step(speed > 4);
-  },
-  onPlant(bot) {
-    bomb.plantAt(bot.site, bot.pos.clone());
-    bots.rotateToSite(bot.site);
-    bots.sendDefuser(bomb.state.pos);
-    hud.setBomb(`BOMB PLANTED at ${bot.site} — ${formatTime(bomb.state.timer)}`, bomb.state.timer < 10);
-  },
-  onDefuse() {
-    bomb.state.mode = 'defused';
-    endRound('EMBER', 'defuse');
-  },
+const game = {
+  now: 0,
+  scene: null,
+  camera: null,
+  renderer: null,
+  world: null,
+  player: null,
+  economy: new Economy(),
+  bomb: null,
+  match: new Match(),
+  bots: [],
+  fighters: [],
+  input: null,
+  hud: null,
+  audio: new AudioSys(),
+  flash: null,
+  viewModel: null,
+  viewModels: {},
+  tracers: [],
+  grenades: [],
+  explosions: [],
+  shotLog: [],
+  nextFireAt: 0,
+  triggerLatch: false,
+  reloading: false,
+  reloadDoneAt: 0,
+  shake: 0,
+  spectate: null,
+  started: false,
+  lastFrame: performance.now(),
+  acc: 0,
 };
-const bots = createBotManager(scene, world, botCtx);
 
-let now = 0;
-let playerHealth = 100;
-let spectateTarget = null;
-let prevFiring = false;
-let stepAt = 0;
-
-const ATTACKERS = [
-  { name: 'VEX', spawn: world.attackerSpawns[1], site: 'A', weaponId: 'rifle' },
-  { name: 'JUNO', spawn: world.attackerSpawns[2], site: 'A', weaponId: 'smg' },
-  { name: 'KAI', spawn: world.attackerSpawns[3], site: 'B', weaponId: 'rifle' },
-];
-const DEFENDERS = [
-  { name: 'RUST', spawn: world.defenderSpawns[0], site: 'A' },
-  { name: 'COAL', spawn: world.defenderSpawns[1], site: 'A' },
-  { name: 'ASH', spawn: world.defenderSpawns[2], site: 'B' },
-  { name: 'SMOKE', spawn: world.defenderSpawns[3], site: 'B' },
-];
-
-function formatTime(s) {
-  const v = Math.max(0, Math.ceil(s));
-  return `${Math.floor(v / 60)}:${String(v % 60).padStart(2, '0')}`;
+function eyeOf(fighter, out) {
+  const eyeY = fighter.eyeY !== undefined ? fighter.eyeY : 1.55;
+  out.set(fighter.pos.x, eyeY, fighter.pos.z);
+  return out;
 }
 
-function siteAt(pos) {
-  for (const [key, site] of Object.entries(world.sites)) {
-    if (Math.hypot(pos.x - site.x, pos.z - site.z) <= site.r) return key;
+// ------------------------------------------------------------------ setup
+
+function buildRenderer() {
+  const renderer = new THREE.WebGLRenderer({ antialias: true, canvas: document.getElementById('game-canvas') });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.1;
+  return renderer;
+}
+
+function buildScene() {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(PALETTE.skyTop);
+  const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.05, 300);
+  camera.rotation.order = 'YXZ';
+  scene.add(camera);
+  return { scene, camera };
+}
+
+function makeTracerPool(scene) {
+  const pool = [];
+  for (let i = 0; i < 14; i++) {
+    const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+    const mat = new THREE.LineBasicMaterial({ color: PALETTE.tracer, transparent: true, opacity: 0 });
+    const line = new THREE.Line(geo, mat);
+    line.visible = false;
+    line.frustumCulled = false;
+    scene.add(line);
+    pool.push({ line, life: 0 });
   }
-  return null;
+  return pool;
 }
 
-function startMatch() {
-  economy.reset();
-  weapons.resetMatch();
-  rounds.startMatch();
-  startRound();
+function spawnTracer(from, to) {
+  const slot = game.tracers.find((t) => t.life <= 0) ?? game.tracers[0];
+  slot.line.geometry.setFromPoints([from, to]);
+  slot.line.visible = true;
+  slot.line.material.opacity = 0.85;
+  slot.life = 0.09;
+}
+
+function updateTracers(dt) {
+  for (const t of game.tracers) {
+    if (t.life <= 0) continue;
+    t.life -= dt;
+    t.line.material.opacity = Math.max(0, t.life / 0.09) * 0.85;
+    if (t.life <= 0) t.line.visible = false;
+  }
+}
+
+function spawnExplosion(pos, radius) {
+  const light = new THREE.PointLight(0xffa040, 120, radius * 4, 1.6);
+  light.position.copy(pos).y += 1;
+  game.scene.add(light);
+  const shell = new THREE.Mesh(
+    new THREE.SphereGeometry(0.5, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0xffc46a, transparent: true, opacity: 0.9 }),
+  );
+  shell.position.copy(pos);
+  game.scene.add(shell);
+  game.explosions.push({ light, shell, life: 0.5, radius });
+  game.audio.explosion();
+  const d2 = dist2DSq(game.player.pos.x, game.player.pos.z, pos.x, pos.z);
+  if (d2 < 30 * 30) game.shake = Math.max(game.shake, 0.5);
+}
+
+function updateExplosions(dt) {
+  for (let i = game.explosions.length - 1; i >= 0; i--) {
+    const ex = game.explosions[i];
+    ex.life -= dt;
+    const k = Math.max(0, ex.life / 0.5);
+    ex.light.intensity = 120 * k;
+    const scale = (1 - k) * ex.radius + 0.5;
+    ex.shell.scale.setScalar(scale);
+    ex.shell.material.opacity = k * 0.9;
+    if (ex.life <= 0) {
+      game.scene.remove(ex.light);
+      game.scene.remove(ex.shell);
+      ex.shell.geometry.dispose();
+      ex.shell.material.dispose();
+      game.explosions.splice(i, 1);
+    }
+  }
+}
+
+// ------------------------------------------------------------------ fighters
+
+function buildFighters() {
+  const world = game.world;
+  const player = new Player(world, SPAWNS.vanguard[0], 'vanguard');
+  player.isBot = false;
+  player.carryingBomb = false;
+  game.player = player;
+  const bots = [];
+  for (let i = 0; i < 3; i++) {
+    bots.push(new Bot(world, game.scene, 'vanguard', i, SPAWNS.vanguard[i + 1], rng));
+  }
+  for (let i = 0; i < 4; i++) {
+    bots.push(new Bot(world, game.scene, 'ember', i, SPAWNS.ember[i], rng));
+  }
+  game.bots = bots;
+  game.fighters = [player, ...bots];
+}
+
+function resetFighters() {
+  const player = game.player;
+  player.respawn(SPAWNS.vanguard[0]);
+  player.slots = [makeSlot('p9'), makeSlot('ar77')];
+  player.currentSlot = 1;
+  player.carryingBomb = false;
+  let vanguardIndex = 0;
+  let emberIndex = 0;
+  game.bots.forEach((bot) => {
+    const spawn = bot.team === 'vanguard'
+      ? SPAWNS.vanguard[1 + vanguardIndex++]
+      : SPAWNS.ember[emberIndex++];
+    bot.respawn(spawn);
+    bot.slot = makeSlot('ar77');
+    bot.assignedSite = bot.team === 'ember' ? (emberIndex % 2 === 1 ? 'A' : 'B') : null;
+    bot.targetSite = null;
+    bot.holdPos = null;
+    bot.moveTarget = null;
+  });
+  // Refill reserves for the weapons the player still owns.
+  for (const slot of player.slots) slot.reserve = slot.def.reserve;
+  game.economy.grenades = 0;
+  game.economy.hasKevlar = false;
+  player.armor = 0;
+}
+
+function assignBombCarrier() {
+  const attackers = game.fighters.filter((f) => f.team === 'vanguard' && f.alive);
+  if (attackers.length === 0) return;
+  const carrier = rng() < 0.3 ? game.player : attackers[Math.floor(rng() * attackers.length)];
+  game.bomb.assign(carrier);
+  carrier.carryingBomb = true;
+  for (const f of attackers) if (f !== carrier) f.carryingBomb = false;
 }
 
 function startRound() {
-  rounds.startRound();
-  playerHealth = 100;
-  playerProxy.alive = true;
-  spectateTarget = null;
-  const spawn = world.attackerSpawns[0];
-  player.state.position.set(spawn.x, 0, spawn.z);
-  player.state.velocity.set(0, 0, 0);
-  player.state.yaw = 0;
-  player.state.pitch = 0;
-  weapons.refillRound();
-  bomb.reset();
-  bomb.giveTo('player');
-  bots.spawnRound(ATTACKERS, DEFENDERS, null);
-  hud.hideBanner();
-  hud.hideAction();
-  hud.setBomb('BOMB — plant it at A or B (hold E on site)', false);
-  showBuyMenu();
-  audio.roundStart();
+  game.match.startRound();
+  resetFighters();
+  game.bomb.reset();
+  assignBombCarrier();
+  game.grenades = [];
+  game.shotLog = [];
+  game.spectate = null;
+  game.hud.showBuyMenu(true, game.economy.money);
+  game.hud.setSiteLabel('DUSTLINE — FREIGHT YARD AT DUSK');
+  swapViewModel();
 }
 
-function beginLive() {
-  rounds.beginLive();
-  hud.hideBuy();
+function startMatch() {
+  game.economy.reset();
+  game.match.startMatch();
+  startRound();
+  game.started = true;
+  game.hud.hideOverlay();
 }
 
-function endRound(winner, reason) {
-  if (!rounds.endRound(winner, reason)) return;
-  economy.roundEnd(winner === 'VANGUARD');
-  hud.hideAction();
-  hud.hideBuy();
-  hud.setBomb('', false);
-  const reasonText = {
-    elimination: winner === 'VANGUARD' ? 'EMBER team eliminated' : 'VANGUARD team eliminated',
-    bomb: 'Bomb detonated',
-    defuse: 'Bomb defused',
-    time: 'Time expired — no plant',
-  }[reason] || reason;
-  const won = winner === 'VANGUARD';
-  hud.showBanner(won ? 'ROUND WON' : 'ROUND LOST', reasonText);
-  if (won) audio.roundWin();
-  else audio.roundLose();
-}
+// ------------------------------------------------------------------ combat
 
-function endMatch() {
-  rounds.endMatch();
-  const won = rounds.state.scoreV > rounds.state.scoreE;
-  hud.showOverlay(won ? 'matchWin' : 'matchLose');
-}
-
-function checkRoundEnd() {
-  if (rounds.state.phase !== 'live') return;
-  const vAlive = bots.aliveCount('VANGUARD') + (playerProxy.alive ? 1 : 0);
-  const eAlive = bots.aliveCount('EMBER');
-  if (eAlive === 0) {
-    endRound('VANGUARD', 'elimination');
-    return;
-  }
-  if (vAlive === 0) {
-    if (bomb.state.mode === 'planted') return; // defenders still have to defuse
-    endRound('EMBER', 'elimination');
-  }
-}
-
-function playerDies(attacker, weaponName, headshot) {
-  playerProxy.alive = false;
-  weapons.onDeath();
-  if (bomb.state.mode === 'carried' && bomb.state.carrier === 'player') {
-    bomb.dropAt(player.state.position.clone());
-  }
-  const attackerName = attacker && !attacker.isPlayer ? attacker.name : '—';
-  hud.addKill(attackerName, weaponName || 'AR-77', 'YOU', headshot);
-  // A friendly bot picks the bomb up if one is close; otherwise it stays dropped.
-  const carrier = bots.bots.find((b) => b.alive && b.team === 'VANGUARD' && Math.hypot(b.pos.x - bomb.state.pos.x, b.pos.z - bomb.state.pos.z) < 6);
-  if (carrier && bomb.state.mode === 'dropped') {
-    bomb.giveTo(carrier);
-    bots.giveBomb(carrier);
-  }
-  spectateTarget = bots.bots.find((b) => b.alive && b.team === 'VANGUARD') || null;
-  hud.showBanner('YOU DIED', 'Spectating your team');
-  checkRoundEnd();
-}
-
-function showBuyMenu() {
-  const items = [
-    { id: 'rifle', key: '1', name: 'AR-77 Rifle', desc: '34 dmg, 30 rounds, reliable', price: WEAPONS.rifle.price, owned: weapons.state.owned.rifle, affordable: economy.money >= WEAPONS.rifle.price },
-    { id: 'smg', key: '2', name: 'VULCAN-9 SMG', desc: '22 dmg, very fast fire', price: WEAPONS.smg.price, owned: weapons.state.owned.smg, affordable: economy.money >= WEAPONS.smg.price },
-    { id: 'sniper', key: '3', name: 'LONGSHOT Sniper', desc: '90 dmg, right-click to zoom', price: WEAPONS.sniper.price, owned: weapons.state.owned.sniper, affordable: economy.money >= WEAPONS.sniper.price },
-    { id: 'grenade', key: '4', name: 'HE Grenade', desc: 'Throw with G, 1.6s fuse', price: GRENADE_PRICE, owned: false, affordable: economy.money >= GRENADE_PRICE },
-    { id: 'armor', key: '5', name: 'Kevlar Armor', desc: 'Halves damage taken', price: ARMOR_PRICE, owned: weapons.state.armor, affordable: economy.money >= ARMOR_PRICE },
-  ];
-  hud.showBuy(items);
-  hud.setMoney(economy.money);
-}
-
-// One purchase attempt, shared by the buy menu's click handler and the
-// 1–5 keys: returns true when the money moved.
-function tryBuy(id) {
-  let price = -1;
-  if (id === 'grenade') price = weapons.buyGrenade(economy.money);
-  else if (id === 'armor') price = weapons.buyArmor(economy.money);
-  else price = weapons.buy(id, economy.money);
-  if (price >= 0) {
-    economy.spend(price);
-    audio.buy();
-    showBuyMenu();
-    return true;
-  }
-  audio.denied();
-  return false;
-}
-
-hud.onBuy((id) => {
-  if (rounds.state.phase !== 'buy') return;
-  tryBuy(id);
-});
-
-hud.onPlay(() => {
-  audio.unlock();
-  input.requestLock();
-  if (rounds.state.phase === 'menu' || rounds.state.phase === 'matchEnd') {
-    hud.hideOverlay();
-    startMatch();
-  } else {
-    hud.hideOverlay();
-  }
-});
+const _eye = new THREE.Vector3();
+const _dir = new THREE.Vector3();
+const _ray = new THREE.Raycaster();
 
 function playerShoot() {
-  const def = weapons.def();
-  if (!weapons.takeRound()) {
-    audio.dryFire();
-    weapons.reload();
+  const player = game.player;
+  const slot = player.currentWeapon;
+  if (!slot || player.reloading) return;
+  const now = game.now;
+  if (now < game.nextFireAt) return;
+  if (slot.mag <= 0) {
+    game.audio.dryFire();
+    game.nextFireAt = now + 0.3;
+    startReload();
     return;
   }
-  weapons.pullTrigger();
-  audio.shot(def.kind);
-  player.recoil(def.id === 'sniper' ? 0.028 : 0.011, (Math.random() - 0.5) * 0.004);
-  const speed = player.groundSpeed();
-  const spread = weapons.spread(speed, input.state.aiming);
-  camera.getWorldDirection(tmpDir);
-  tmpDir.x += (Math.random() - 0.5) * 2 * spread;
-  tmpDir.y += (Math.random() - 0.5) * 2 * spread;
-  tmpDir.z += (Math.random() - 0.5) * 2 * spread;
-  tmpDir.normalize();
-  camera.getWorldPosition(tmpFrom);
-  tmpFrom.add(tmpDir.clone().multiplyScalar(0.6));
-  const hit = shootRay(tmpFrom, tmpDir, 90);
-  const end = hit ? hit.point : tmpFrom.clone().add(tmpDir.clone().multiplyScalar(60));
-  spawnTracer(tmpFrom, end);
-  if (hit && hit.botName) {
-    const target = botByName(hit.botName);
-    const headshot = hit.objectName.startsWith('head:');
-    let damage = headshot ? def.headDamage : def.damage;
-    if (hit.distance > 45) damage = Math.round(damage * 0.6);
-    else if (hit.distance > 30) damage = Math.round(damage * 0.8);
-    const wasAlive = target && target.alive;
-    applyDamage(target, damage, headshot, playerProxy, def.name);
-    if (wasAlive) {
-      hud.hitMarker(target && !target.alive, headshot);
-      audio.hit(headshot);
-    }
-  } else if (hit) {
-    spawnPuff(hit.point);
+  const def = slot.def;
+  game.nextFireAt = now + def.fireInterval;
+  slot.mag -= 1;
+  player.heat = Math.min(1, player.heat + (def.kind === 'sniper' ? 0.5 : 0.18));
+  player.lastShotAt = now;
+  eyeOf(player, _eye);
+  player.forward(_dir);
+  const spread = spreadFor(def, { moving: player.moving, airborne: !player.onGround, aiming: player.aiming, heat: player.heat });
+  const jitter = () => (rng() + rng() + rng() - 1.5) * spread;
+  _dir.x += jitter();
+  _dir.y += jitter();
+  _dir.z += jitter();
+  _dir.normalize();
+  _ray.set(_eye, _dir);
+  _ray.far = def.range;
+  const targets = [];
+  for (const bot of game.bots) {
+    if (bot.alive && bot.team !== player.team) targets.push(...bot.hitMeshes);
   }
-  bots.hearNoise(tmpFrom, 'VANGUARD');
+  const hits = _ray.intersectObjects([...targets, ...game.world.blockers], false);
+  const muzzle = _eye.clone().addScaledVector(_dir, 0.6);
+  if (hits.length > 0) {
+    const hit = hits[0];
+    spawnTracer(muzzle, hit.point);
+    const fighter = hit.object.userData.fighter;
+    if (fighter) {
+      const headshot = hit.object.userData.part === 'head';
+      const damage = damageAtRange(def, hit.distance, headshot);
+      game.audio.hit(headshot);
+      game.hud.showHitmarker(headshot);
+      damageFighter(fighter, damage, player, headshot);
+    }
+  } else {
+    spawnTracer(muzzle, _eye.clone().addScaledVector(_dir, def.range));
+  }
+  game.flash.fire();
+  game.audio.shot(def.id);
+  game.viewModel.position.z = -0.55 + def.kick * 2;
+  logShot(player.pos.x, player.pos.z, player.team);
+}
+
+function startReload() {
+  const player = game.player;
+  const slot = player.currentWeapon;
+  if (!slot || player.reloading || slot.mag === slot.def.mag || slot.reserve <= 0) return;
+  player.reloading = true;
+  game.reloadDoneAt = game.now + slot.def.reloadTime;
+  game.audio.reload();
+}
+
+function finishReload() {
+  const player = game.player;
+  const slot = player.currentWeapon;
+  player.reloading = false;
+  if (!slot) return;
+  const needed = slot.def.mag - slot.mag;
+  const taken = Math.min(needed, slot.reserve);
+  slot.mag += taken;
+  slot.reserve -= taken;
+}
+
+function throwGrenade() {
+  const player = game.player;
+  if (!player.alive || game.economy.grenades <= 0 || game.match.phase !== 'live') return;
+  game.economy.grenades -= 1;
+  eyeOf(player, _eye);
+  player.forward(_dir);
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.09, 8, 8),
+    new THREE.MeshStandardMaterial({ color: 0x2a4a2a, roughness: 0.6, metalness: 0.4 }),
+  );
+  mesh.position.copy(_eye);
+  game.scene.add(mesh);
+  game.grenades.push({
+    mesh,
+    vel: _dir.clone().multiplyScalar(15).add(new THREE.Vector3(0, 4.5, 0)),
+    fuse: GRENADE.fuse,
+  });
+  game.audio.grenadePin();
 }
 
 function updateGrenades(dt) {
-  for (let i = grenades.length - 1; i >= 0; i -= 1) {
-    const g = grenades[i];
+  for (let i = game.grenades.length - 1; i >= 0; i--) {
+    const g = game.grenades[i];
     g.fuse -= dt;
-    g.vel.y -= 20 * dt;
+    g.vel.y -= 18 * dt;
     g.mesh.position.addScaledVector(g.vel, dt);
-    const p = g.mesh.position;
-    for (const box of world.colliders) {
-      if (p.x > box.min.x && p.x < box.max.x && p.y > box.min.y && p.y < box.max.y && p.z > box.min.z && p.z < box.max.z) {
-        // Bounce: push out along the smallest penetration and dampen.
-        const dxl = p.x - box.min.x;
-        const dxr = box.max.x - p.x;
-        const dzl = p.z - box.min.z;
-        const dzr = box.max.z - p.z;
-        const dyl = p.y - box.min.y;
-        const dyr = box.max.y - p.y;
-        const m = Math.min(dxl, dxr, dzl, dzr, dyl, dyr);
-        if (m === dxl) { p.x = box.min.x - 0.01; g.vel.x = -Math.abs(g.vel.x) * 0.4; }
-        else if (m === dxr) { p.x = box.max.x + 0.01; g.vel.x = Math.abs(g.vel.x) * 0.4; }
-        else if (m === dzl) { p.z = box.min.z - 0.01; g.vel.z = -Math.abs(g.vel.z) * 0.4; }
-        else if (m === dzr) { p.z = box.max.z + 0.01; g.vel.z = Math.abs(g.vel.z) * 0.4; }
-        else if (m === dyl) { p.y = box.min.y - 0.01; g.vel.y = -Math.abs(g.vel.y) * 0.4; }
-        else { p.y = box.max.y + 0.01; g.vel.y = Math.abs(g.vel.y) * 0.4; }
-      }
-    }
-    if (p.y < 0.09) {
-      p.y = 0.09;
-      g.vel.y = Math.abs(g.vel.y) * 0.4;
+    if (g.mesh.position.y < 0.12) {
+      g.mesh.position.y = 0.12;
+      g.vel.y *= -0.4;
       g.vel.x *= 0.7;
       g.vel.z *= 0.7;
     }
     if (g.fuse <= 0) {
-      explode(p.clone(), 5.5, 110, playerProxy);
-      scene.remove(g.mesh);
-      grenades.splice(i, 1);
+      const pos = g.mesh.position.clone();
+      game.scene.remove(g.mesh);
+      game.grenades.splice(i, 1);
+      spawnExplosion(pos, GRENADE.radius);
+      for (const fighter of game.fighters) {
+        if (!fighter.alive) continue;
+        const d = Math.sqrt(dist2DSq(fighter.pos.x, fighter.pos.z, pos.x, pos.z));
+        if (d > GRENADE.radius) continue;
+        const damage = Math.round(GRENADE.maxDamage * (1 - d / GRENADE.radius) + 10);
+        damageFighter(fighter, damage, game.player, false);
+      }
     }
   }
 }
 
-function updatePlayer(dt) {
-  const look = input.takeLook();
-  player.look(look.x, look.y);
-  player.step(dt, input.state.keys);
-  const speed = player.groundSpeed();
-  if (player.state.onGround && speed > 1.5 && now - stepAt > 0.38) {
-    stepAt = now;
-    audio.step(speed > 4);
+function logShot(x, z, team) {
+  game.shotLog.push({ x, z, team, at: game.now });
+  if (game.shotLog.length > 24) game.shotLog.shift();
+  for (const bot of game.bots) bot.hearShot(x, z, team, game.now);
+}
+
+function damageFighter(target, amount, attacker, headshot) {
+  if (!target.alive) return;
+  const taken = target.takeDamage(amount);
+  void taken;
+  if (target === game.player) {
+    game.audio.hurt();
+    const dx = attacker.pos.x - target.pos.x;
+    const dz = attacker.pos.z - target.pos.z;
+    const worldAngle = Math.atan2(dx, dz);
+    const relative = worldAngle + target.yaw;
+    game.hud.showDamageFrom((relative * 180) / Math.PI);
+    game.shake = Math.max(game.shake, 0.25);
   }
-  // Aim: the sniper zooms with right mouse; other weapons stay at full FOV.
-  const wantFov = input.state.aiming && weapons.def().id === 'sniper' ? FOV / WEAPONS.sniper.zoom : FOV;
-  if (Math.abs(camera.fov - wantFov) > 0.1) {
-    camera.fov += (wantFov - camera.fov) * Math.min(1, dt * 14);
+  if (!target.alive) handleDeath(target, attacker, headshot);
+}
+
+function handleDeath(target, attacker, headshot) {
+  const killerName = attacker === game.player ? 'YOU' : attacker.name ?? '???';
+  const victimName = target === game.player ? 'YOU' : target.name ?? '???';
+  game.hud.addKill(killerName, victimName, headshot);
+  if (attacker === game.player && target !== game.player) {
+    game.economy.rewardKill();
+  }
+  if (target.carryingBomb) {
+    target.carryingBomb = false;
+    game.bomb.dropAt(target.pos.x, target.pos.z);
+  }
+  if (target === game.player) {
+    // Death strips bought gear: primary, armor, grenades.
+    const bought = game.player.slots.find((s) => s.def.price > 0);
+    if (bought) {
+      game.player.slots = game.player.slots.filter((s) => s !== bought);
+      game.player.currentSlot = Math.min(game.player.currentSlot, game.player.slots.length - 1);
+      swapViewModel();
+    }
+    game.economy.onDeath();
+    game.player.armor = 0;
+    const aliveMate = game.bots.find((b) => b.team === 'vanguard' && b.alive);
+    game.spectate = aliveMate ?? null;
+  }
+  checkRoundEnd();
+}
+
+function checkRoundEnd() {
+  if (game.match.phase !== 'live') return;
+  const vanguardAlive = game.fighters.some((f) => f.team === 'vanguard' && f.alive);
+  const emberAlive = game.fighters.some((f) => f.team === 'ember' && f.alive);
+  if (!vanguardAlive) endRound('ember', 'VANGUARD ELIMINATED');
+  else if (!emberAlive) endRound('vanguard', 'EMBER ELIMINATED');
+}
+
+function endRound(winner, reason) {
+  if (game.match.phase === 'over') return;
+  const matchWinner = game.match.endRound(winner, reason, game.now);
+  game.economy.settleRound(winner === 'vanguard');
+  game.audio.roundSting(winner === 'vanguard');
+  game.hud.showBuyMenu(false);
+  const title = matchWinner
+    ? `${TEAM_LABEL[matchWinner]} WINS THE MATCH`
+    : `${TEAM_LABEL[winner]} WINS THE ROUND`;
+  game.hud.showBanner(title, `${reason} — ${game.match.scoreText()}`, winner);
+  game.input.exitLock();
+}
+
+function settleAfterRound() {
+  if (game.match.over) {
+    game.hud.showOverlay(
+      `${TEAM_LABEL[game.match.matchWinner]} WINS THE MATCH`,
+      `Final score ${game.match.scoreText()} — first to five rounds.`,
+      'Press R to play again',
+    );
+    return;
+  }
+  game.match.nextRound();
+  startRound();
+}
+
+// ------------------------------------------------------------------ buying
+
+function buyItem(itemId) {
+  if (game.match.phase !== 'buy') return;
+  const owned = game.player.slots.map((s) => s.def.id);
+  const result = game.economy.buy(itemId, owned);
+  game.hud.flashBuy(itemId, result);
+  if (result === 'ok') {
+    game.audio.buyOk();
+    if (itemId === 'kevlar') game.player.armor = 100;
+    else if (itemId !== 'he') {
+      game.player.slots.push(makeSlot(itemId));
+      game.player.currentSlot = game.player.slots.length - 1;
+      swapViewModel();
+    }
+  } else {
+    game.audio.buyDeny();
+  }
+  game.hud.showBuyMenu(true, game.economy.money);
+}
+
+function swapViewModel() {
+  const camera = game.camera;
+  if (game.viewModel) camera.remove(game.viewModel);
+  const slot = game.player.currentWeapon;
+  if (!slot) return;
+  if (!game.viewModels[slot.def.id]) game.viewModels[slot.def.id] = makeViewModel(slot.def.id);
+  game.viewModel = game.viewModels[slot.def.id];
+  game.viewModel.position.set(0.28, -0.26, -0.55);
+  camera.add(game.viewModel);
+  if (game.flash) game.flash.light.position.set(0.28, -0.2, -1.1);
+}
+
+// ------------------------------------------------------------------ input
+
+function bindInput() {
+  const input = game.input;
+  input.onKey = (code) => {
+    if (code === 'KeyB' && (game.match.phase === 'buy' || game.match.phase === 'live')) {
+      const menu = document.getElementById('buy-menu');
+      const open = menu.classList.contains('hidden');
+      if (game.match.phase === 'buy' || open === false) game.hud.showBuyMenu(open, game.economy.money);
+    }
+    if (game.match.phase === 'buy' && ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5'].includes(code)) {
+      const item = { Digit1: 'vulcan', Digit2: 'longshot', Digit3: 'he', Digit4: 'kevlar', Digit5: 'ar77' }[code];
+      buyItem(item);
+    } else if (game.match.phase === 'live' && ['Digit1', 'Digit2', 'Digit3'].includes(code)) {
+      const index = parseInt(code.slice(-1), 10) - 1;
+      if (game.player.slots[index]) {
+        game.player.currentSlot = index;
+        swapViewModel();
+      }
+    }
+    if (code === 'KeyR') {
+      if (game.match.over) {
+        startMatch();
+        input.requestLock();
+      } else if (game.match.phase === 'live') {
+        startReload();
+      }
+    }
+    if (code === 'KeyG') throwGrenade();
+    if (code === 'KeyQ' && game.match.phase === 'live') {
+      game.player.currentSlot = (game.player.currentSlot + 1) % game.player.slots.length;
+      swapViewModel();
+    }
+  };
+  input.onMouseDown = (button) => {
+    if (game.match.phase === 'menu') return;
+    if (button === 0) game.triggerLatch = true;
+    if (button === 2) game.player.aiming = true;
+  };
+  input.onMouseUp = (button) => {
+    if (button === 2) game.player.aiming = false;
+  };
+  document.getElementById('buy-list')?.addEventListener('click', (event) => {
+    const row = event.target.closest('.buy-row');
+    if (row) buyItem(row.dataset.item);
+  });
+  document.getElementById('overlay')?.addEventListener('click', () => {
+    if (game.match.phase === 'menu' || game.match.over) {
+      startMatch();
+      input.requestLock();
+    }
+  });
+  window.addEventListener('resize', () => {
+    game.camera.aspect = window.innerWidth / window.innerHeight;
+    game.camera.updateProjectionMatrix();
+    game.renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+}
+
+// ------------------------------------------------------------------ simulation
+
+function simStep(dt) {
+  const now = game.now;
+  const match = game.match;
+  const player = game.player;
+  if (match.phase === 'buy' || match.phase === 'live') {
+    const event = match.tick(dt);
+    if (event === 'live') {
+      game.hud.showBuyMenu(false);
+    } else if (event === 'timeout') {
+      endRound('ember', 'TIME EXPIRED — NO PLANT');
+    }
+  }
+  if (match.phase === 'over' && now > match.bannerUntil) {
+    settleAfterRound();
+    return;
+  }
+  if (match.phase !== 'buy' && match.phase !== 'live') return;
+
+  // Player movement and look.
+  const { dx, dy } = game.input.consumeMouse();
+  if (game.input.locked) player.look(dx, dy);
+  const wish = game.input.moveWish();
+  const crouch = game.input.down('ControlLeft') || game.input.down('KeyC');
+  player.step(wish, dt, crouch);
+  if (player.moving && player.onGround) game.audio.footstep(wish.z !== 0);
+
+  // Reload timing.
+  if (player.reloading && now >= game.reloadDoneAt) finishReload();
+
+  // Shooting: auto weapons fire while held, single-shot weapons once.
+  const slot = player.currentWeapon;
+  if (slot && player.alive && match.phase === 'live') {
+    if (slot.def.auto) {
+      if (game.input.mouseDown) playerShoot();
+    } else if (game.triggerLatch) {
+      playerShoot();
+    }
+  }
+  game.triggerLatch = false;
+
+  // Plant / defuse on E.
+  const holdingE = game.input.down('KeyE');
+  if (player.alive && game.bomb.carrier === player && match.phase === 'live') {
+    const siteId = game.world.insideSite('A', player.pos.x, player.pos.z)
+      ? 'A'
+      : game.world.insideSite('B', player.pos.x, player.pos.z) ? 'B' : null;
+    if (game.bomb.plantStep(player, siteId, holdingE, dt)) {
+      game.economy.rewardPlant();
+      game.audio.roundSting(true);
+      game.hud.showBanner('BOMB PLANTED', `AT SITE ${siteId} — DEFEND IT`, 'vanguard');
+    } else if (holdingE && siteId) {
+      game.audio.plantTick();
+    }
+  }
+
+  // Bomb pickup by walking over it.
+  if (game.bomb.state === 'dropped' && player.alive) {
+    if (dist2DSq(player.pos.x, player.pos.z, game.bomb.pos.x, game.bomb.pos.z) < 1.4 * 1.4) {
+      game.bomb.assign(player);
+      player.carryingBomb = true;
+    }
+  }
+
+  // Bomb timer and detonation.
+  const bombEvent = game.bomb.update(dt, now);
+  if (bombEvent === 'exploded') {
+    spawnExplosion(game.bomb.pos, 12);
+    endRound('vanguard', 'BOMB DETONATED');
+    return;
+  }
+
+  // Bots.
+  const ctx = {
+    world: game.world,
+    fighters: game.fighters,
+    bomb: game.bomb,
+    rng,
+    damageFighter,
+    tracer: spawnTracer,
+    onPlant: (bot, siteId) => {
+      game.hud.showBanner('BOMB PLANTED', `${bot.name} PLANTED AT SITE ${siteId}`, 'vanguard');
+    },
+    onDefuse: (bot) => {
+      game.hud.showBanner('BOMB DEFUSED', `${bot.name} DEFUSED THE BOMB`, 'ember');
+      endRound('ember', 'BOMB DEFUSED');
+    },
+    onPickup: () => {},
+    onBotShot: (bot) => {
+      logShot(bot.pos.x, bot.pos.z, bot.team);
+      game.audio.distantShot();
+    },
+  };
+  for (const bot of game.bots) bot.update(dt, now, ctx);
+
+  updateGrenades(dt);
+}
+
+function renderFrame() {
+  const player = game.player;
+  const camera = game.camera;
+  // A staged overview (the ?shot=start screenshot) keeps its camera.
+  if (game.stagedOverview) {
+    game.flash.update(1 / 60);
+    updateTracers(1 / 60);
+    updateExplosions(1 / 60);
+    game.hud.update({ player, economy: game.economy, match: game.match, bomb: game.bomb, spread: 0.01 });
+    game.renderer.render(game.scene, camera);
+    return;
+  }
+  // Camera follows the player, or a living teammate while spectating.
+  const focus = player.alive ? player : game.spectate;
+  if (focus) {
+    eyeOf(focus, _eye);
+    camera.position.copy(_eye);
+    if (focus === player) {
+      camera.rotation.set(player.pitch, player.yaw, 0);
+    } else {
+      camera.rotation.set(0, focus.yaw, 0);
+    }
+  }
+  if (game.shake > 0) {
+    camera.rotation.x += (rng() - 0.5) * game.shake * 0.05;
+    camera.rotation.z += (rng() - 0.5) * game.shake * 0.05;
+    game.shake = Math.max(0, game.shake - 0.02);
+  }
+  // Aim narrows the field of view; the sniper zooms further.
+  const targetFov = player.aiming ? (player.currentWeapon?.def.id === 'longshot' ? 38 : 55) : 75;
+  if (Math.abs(camera.fov - targetFov) > 0.05) {
+    camera.fov = lerp(camera.fov, targetFov, 0.25);
     camera.updateProjectionMatrix();
   }
-  // Fire: autos fire while held, semi-autos once per press.
-  const firing = input.state.firing;
-  const def = weapons.def();
-  if (firing && weapons.ready()) {
-    if (def.auto || !prevFiring) playerShoot();
+  // View-model bob and recoil recovery.
+  if (game.viewModel) {
+    const bob = player.moving ? Math.sin(game.now * 9) * 0.012 : 0;
+    game.viewModel.position.y = -0.26 + bob;
+    game.viewModel.position.x = 0.28 + (player.aiming ? -0.1 : 0);
+    game.viewModel.position.z = lerp(game.viewModel.position.z, player.aiming ? -0.45 : -0.55, 0.2);
   }
-  prevFiring = firing;
-  // One-shot actions: reload, grenade, weapon switching, buy menu.
-  for (const action of input.takePressed()) {
-    if (action === 'reload') {
-      if (weapons.reload()) audio.reload();
-    } else if (action === 'grenade') {
-      if (rounds.state.phase === 'live' && weapons.state.grenades > 0) {
-        camera.getWorldDirection(tmpDir);
-        camera.getWorldPosition(tmpFrom);
-        throwGrenade(tmpFrom.clone().add(tmpDir.clone().multiplyScalar(0.8)), tmpDir.clone());
-      }
-    } else if (action === 'cycle') {
-      const order = ['pistol', 'rifle', 'smg', 'sniper'].filter((id) => weapons.state.owned[id]);
-      const next = order[(order.indexOf(weapons.state.current) + 1) % order.length];
-      if (weapons.switchTo(next)) audio.click();
-    } else if (action.startsWith('slot')) {
-      const slot = Number(action.slice(4));
-      const buyOpen = rounds.state.phase === 'buy' && !document.getElementById('buy-menu').hidden;
-      if (buyOpen) {
-        // In the buy menu the same keys buy instead of switching weapons.
-        const buyIds = ['rifle', 'smg', 'sniper', 'grenade', 'armor'];
-        const id = buyIds[slot - 1];
-        if (id) tryBuy(id);
-        continue;
-      }
-      const order = ['pistol', 'rifle', 'smg', 'sniper'];
-      const id = order[slot - 1];
-      if (id && weapons.switchTo(id)) audio.click();
-    } else if (action === 'buy') {
-      if (rounds.state.phase === 'buy') {
-        const menuOpen = !document.getElementById('buy-menu').hidden;
-        if (menuOpen) hud.hideBuy();
-        else showBuyMenu();
-      }
-    }
+  game.flash.update(1 / 60);
+  updateTracers(1 / 60);
+  updateExplosions(1 / 60);
+  const spread = player.currentWeapon
+    ? spreadFor(player.currentWeapon.def, { moving: player.moving, airborne: !player.onGround, aiming: player.aiming, heat: player.heat })
+    : 0.01;
+  game.hud.update({ player, economy: game.economy, match: game.match, bomb: game.bomb, spread });
+  game.renderer.render(game.scene, camera);
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const nowMs = performance.now();
+  let dt = (nowMs - game.lastFrame) / 1000;
+  game.lastFrame = nowMs;
+  if (dt > 0.1) dt = 0.1;
+  game.acc += dt;
+  let steps = 0;
+  while (game.acc >= STEP && steps < 5) {
+    game.now += STEP;
+    simStep(STEP);
+    game.acc -= STEP;
+    steps += 1;
   }
-  // Planting: hold E, standing still, on a site, while carrying the bomb.
-  if (bomb.state.mode === 'carried' && bomb.state.carrier === 'player') {
-    const site = siteAt(player.state.position);
-    const holding = input.state.keys.has('KeyE');
-    const still = speed < 1;
-    if (site && holding && still && rounds.state.phase === 'live') {
-      bomb.state.plantProgress += dt;
-      hud.showAction(`PLANTING AT ${site} — hold E`, bomb.state.plantProgress / PLANT_TIME);
-      if (Math.floor(bomb.state.plantProgress * 4) !== Math.floor((bomb.state.plantProgress - dt) * 4)) audio.plantTick();
-      if (bomb.state.plantProgress >= PLANT_TIME) {
-        bomb.plantAt(site, player.state.position.clone());
-        economy.add(PLANT_REWARD);
-        hud.hideAction();
-        bots.rotateToSite(site);
-        bots.sendDefuser(bomb.state.pos);
-        hud.setBomb(`BOMB PLANTED at ${site} — ${formatTime(bomb.state.timer)}`, false);
-      }
-    } else {
-      if (bomb.state.plantProgress > 0) bomb.state.plantProgress = Math.max(0, bomb.state.plantProgress - dt * 2);
-      hud.hideAction();
+  renderFrame();
+}
+
+// ------------------------------------------------------------------ staged shots
+
+function stageShot() {
+  if (!SHOT) return;
+  if (SHOT === 'start') {
+    game.match.phase = 'menu';
+    game.hud.showOverlay(
+      'DUSTLINE',
+      'Tactical FPS — freight yard at dusk. VANGUARD attacks, EMBER defends two bomb sites. First to five rounds.',
+      'Click to play — WASD move, mouse aim, B buy menu, E plant / defuse',
+    );
+    game.stagedOverview = true;
+    game.camera.position.set(6, 16, 30);
+    game.camera.lookAt(0, 1, -6);
+    return;
+  }
+  startMatch();
+  if (SHOT === 'buy') {
+    game.player.pos.set(-2, 0, 24);
+    game.player.yaw = 0;
+    game.hud.showBuyMenu(true, game.economy.money);
+    return;
+  }
+  if (SHOT === 'play') {
+    game.match.startLive();
+    game.match.clock = 92;
+    game.hud.showBuyMenu(false);
+    // Ten seconds of bot play so the yard is alive in the frame.
+    for (let i = 0; i < 10 * 60; i++) {
+      game.now += STEP;
+      simStep(STEP);
     }
-  } else if (bomb.state.mode === 'dropped') {
-    // Walk over a dropped bomb to pick it up.
-    const d = Math.hypot(player.state.position.x - bomb.state.pos.x, player.state.position.z - bomb.state.pos.z);
-    if (d < 1.3 && playerProxy.alive) {
-      bomb.giveTo('player');
-      hud.setBomb('BOMB — plant it at A or B (hold E on site)', false);
+    game.player.pos.set(2, 0, 16);
+    game.player.yaw = 0.15;
+    game.player.pitch = 0.02;
+    return;
+  }
+  if (SHOT === 'end') {
+    game.match.score = { vanguard: 2, ember: 1 };
+    game.match.round = 4;
+    game.match.startLive();
+    for (let i = 0; i < 5 * 60; i++) {
+      game.now += STEP;
+      simStep(STEP);
     }
+    endRound('vanguard', 'BOMB DETONATED');
+    // Keep the banner up for the screenshot: no settle, no auto-hide.
+    game.match.bannerUntil = Infinity;
+    game.hud.showBanner('VANGUARD WINS THE ROUND', `BOMB DETONATED — ${game.match.scoreText()}`, 'vanguard');
+    clearTimeout(game.hud.bannerTimer);
+    game.player.pos.set(0, 0, 16);
+    game.player.yaw = 0;
+    game.player.pitch = 0;
   }
 }
 
-function updateSpectate(dt) {
-  if (!spectateTarget || !spectateTarget.alive) {
-    spectateTarget = bots.bots.find((b) => b.alive && b.team === 'VANGUARD') || null;
-    if (!spectateTarget) return;
-  }
-  camera.position.set(spectateTarget.pos.x, spectateTarget.pos.y + 1.55, spectateTarget.pos.z);
-  camera.rotation.set(spectateTarget.pitch, spectateTarget.yaw, 0);
-  camera.fov += (FOV - camera.fov) * Math.min(1, dt * 8);
-  camera.updateProjectionMatrix();
-}
+// ------------------------------------------------------------------ boot
 
-function updateHud() {
-  const r = rounds.state;
-  hud.setHealth(playerHealth);
-  hud.setArmor(weapons.state.armor);
-  hud.setAmmo(weapons.state.mag, weapons.state.reserve);
-  hud.setWeapon(weapons.def().name, weapons.state.grenades);
-  hud.setMoney(economy.money);
-  hud.setTimer(r.timer, r.phase);
-  hud.setScore(r.scoreV, r.scoreE, Math.max(1, r.round), MAX_ROUNDS);
-  const slotOrder = ['pistol', 'rifle', 'smg', 'sniper'];
-  const slots = slotOrder
-    .filter((id) => weapons.state.owned[id])
-    .map((id) => ({ id, key: slotOrder.indexOf(id) + 1, name: WEAPONS[id].name, owned: true }));
-  hud.setSlots(slots, weapons.state.current);
-  const spreadPx = 6 + weapons.spread(player.groundSpeed(), input.state.aiming) * 900;
-  hud.setCrosshair(spreadPx);
-  if (bomb.state.mode === 'planted') {
-    hud.setBomb(`BOMB PLANTED at ${bomb.state.site} — ${formatTime(bomb.state.timer)}`, bomb.state.timer < 10);
-  } else if (bomb.state.mode === 'dropped') {
-    hud.setBomb('BOMB DROPPED — pick it up', false);
-  } else if (bomb.state.mode === 'carried' && bomb.state.carrier && bomb.state.carrier !== 'player') {
-    hud.setBomb(`${bomb.state.carrier.name} carries the bomb`, false);
+function boot() {
+  game.renderer = buildRenderer();
+  const { scene, camera } = buildScene();
+  game.scene = scene;
+  game.camera = camera;
+  game.world = new World(scene, rng);
+  game.bomb = new Bomb(scene);
+  game.tracers = makeTracerPool(scene);
+  buildFighters();
+  resetFighters();
+  game.input = new Input(game.renderer.domElement);
+  game.hud = new Hud();
+  game.flash = new MuzzleFlash(scene);
+  camera.add(game.flash.light);
+  game.flash.light.position.set(0.28, -0.2, -1.1);
+  bindInput();
+  swapViewModel();
+  game.audio.ensure();
+  if (SHOT) {
+    stageShot();
+  } else {
+    game.hud.showOverlay(
+      'DUSTLINE',
+      'Tactical FPS — freight yard at dusk. VANGUARD attacks, EMBER defends two bomb sites. First to five rounds.',
+      'Click to play — WASD move, mouse aim, B buy menu, E plant / defuse',
+    );
   }
-}
-
-// One fixed simulation step.
-function update(dt) {
-  now += dt;
-  const r = rounds.state;
-
-  if (r.phase === 'buy') {
-    rounds.step(dt);
-    if (r.timer <= 0) beginLive();
-    if (playerProxy.alive) updatePlayer(dt);
-    bots.update(dt, playerProxy);
-  } else if (r.phase === 'live') {
-    rounds.step(dt);
-    if (playerProxy.alive) updatePlayer(dt);
-    else updateSpectate(dt);
-    bots.update(dt, playerProxy);
-    updateGrenades(dt);
-    bomb.step(dt, now, (urgent) => audio.beep(urgent));
-    if (bomb.state.mode === 'planted' && bomb.state.timer <= 0) {
-      explode(bomb.state.pos.clone().add(new THREE.Vector3(0, 0.5, 0)), 14, 200, null);
-      bomb.state.mode = 'exploded';
-      endRound('VANGUARD', 'bomb');
-    }
-    if (r.timer <= 0 && bomb.state.mode !== 'planted') {
-      endRound('EMBER', 'time');
-    }
-    // A dropped bomb near a friendly bot gets picked up.
-    if (bomb.state.mode === 'dropped') {
-      const carrier = bots.bots.find((b) => b.alive && b.team === 'VANGUARD' && Math.hypot(b.pos.x - bomb.state.pos.x, b.pos.z - bomb.state.pos.z) < 1.5);
-      if (carrier) {
-        bomb.giveTo(carrier);
-        bots.giveBomb(carrier);
-      }
-    }
-  } else if (r.phase === 'end') {
-    rounds.step(dt);
-    bots.update(dt, playerProxy);
-    updateGrenades(dt);
-    if (playerProxy.alive) updatePlayer(dt);
-    else updateSpectate(dt);
-    if (r.timer <= 0) {
-      if (rounds.matchOver()) endMatch();
-      else startRound();
-    }
-  }
-
-  weapons.step(dt);
-  // Tracers and puffs fade.
-  for (const t of tracers) {
-    if (t.life > 0) {
-      t.life -= dt;
-      t.line.material.opacity = Math.max(0, t.life / 0.07) * 0.85;
-      if (t.life <= 0) t.line.visible = false;
-    }
-  }
-  for (const p of puffs) {
-    if (p.life > 0) {
-      p.life -= dt;
-      p.mesh.scale.setScalar(1 + (0.3 - p.life) * 6);
-      p.mesh.material.opacity = Math.max(0, p.life / 0.3) * 0.8;
-      if (p.life <= 0) p.mesh.visible = false;
-    }
-  }
-  if (explosionLife > 0) {
-    explosionLife -= dt;
-    const t = 1 - explosionLife / 0.5;
-    explosionMesh.scale.setScalar(1 + t * 11);
-    explosionMesh.material.opacity = Math.max(0, 0.9 * (1 - t));
-    explosionLight.intensity = 60 * (1 - t);
-    if (explosionLife <= 0) {
-      explosionMesh.visible = false;
-      explosionLight.intensity = 0;
-    }
-  }
-  shake = Math.max(0, shake - dt * 1.8);
-  updateHud();
-
-  // Camera follows the player (first person) unless spectating.
-  if (playerProxy.alive) {
-    camera.position.set(player.state.position.x, player.state.position.y + player.state.eye, player.state.position.z);
-    camera.rotation.set(player.state.pitch, player.state.yaw, 0);
-    if (shake > 0) {
-      camera.rotation.x += (Math.random() - 0.5) * shake * 0.06;
-      camera.rotation.y += (Math.random() - 0.5) * shake * 0.06;
-    }
-  }
-}
-
-function resize() {
-  const w = canvas.clientWidth || window.innerWidth;
-  const h = canvas.clientHeight || window.innerHeight;
-  renderer.setSize(w, h, false);
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
-}
-window.addEventListener('resize', resize);
-resize();
-
-function render() {
-  renderer.render(scene, camera);
-}
-
-// Fixed-step simulation, render at display rate.
-let accumulator = 0;
-let last = performance.now();
-function frame(time) {
-  const elapsed = Math.min(0.1, (time - last) / 1000);
-  last = time;
-  accumulator += elapsed;
-  while (accumulator >= FIXED_STEP) {
-    update(FIXED_STEP);
-    accumulator -= FIXED_STEP;
-  }
-  render();
+  game.lastFrame = performance.now();
   requestAnimationFrame(frame);
 }
 
-// Deterministic captures: set up a frame, render it twice, freeze.
-function runShot(mode, seedValue) {
-  const rng = mulberry32(seedValue);
-  window.__shotReady = false;
-  if (mode === 'start') {
-    rounds.state.phase = 'menu';
-    player.state.position.set(0, 0, 13);
-    player.state.yaw = 0;
-    player.state.pitch = 0.02;
-    bots.spawnRound(ATTACKERS, DEFENDERS, null);
-    hud.showOverlay('start');
-  } else if (mode === 'buy') {
-    hud.hideOverlay();
-    startMatch();
-    // Buy phase with the menu open and some money to spend.
-    economy.add(2000);
-    showBuyMenu();
-  } else if (mode === 'play') {
-    hud.hideOverlay();
-    startMatch();
-    rounds.beginLive();
-    hud.hideBuy();
-    // Player at mid, aiming down the lane at a defender standing in the open.
-    player.state.position.set(0, 0, 4);
-    player.state.yaw = 0;
-    player.state.pitch = 0;
-    const defender = bots.bots.find((b) => b.team === 'EMBER');
-    if (defender) {
-      defender.pos.set(-0.5, 0, -4);
-      defender.group.position.copy(defender.pos);
-      defender.yaw = Math.PI;
-      defender.group.rotation.y = Math.PI;
-    }
-    // Fire once so the muzzle flash and tracer are in the frame.
-    playerShoot();
-    weapons.step(0.03);
-  } else if (mode === 'end') {
-    hud.hideOverlay();
-    startMatch();
-    rounds.beginLive();
-    hud.hideBuy();
-    // Stand at mid so the yard is the backdrop behind the banner.
-    player.state.position.set(0, 0, 4);
-    player.state.yaw = 0;
-    player.state.pitch = 0;
-    endRound('VANGUARD', 'elimination');
-  }
-  update(0);
-  render();
-  render();
-  window.__shotReady = true;
-}
-
-// Debug hook for automated testing: the live state, read-only from outside.
-window.__game = {
-  rounds,
-  bots,
-  bomb,
-  economy,
-  get playerHealth() {
-    return playerHealth;
-  },
-  get playerPos() {
-    return { x: player.state.position.x, z: player.state.position.z, alive: playerProxy.alive };
-  },
-  get phase() {
-    return rounds.state.phase;
-  },
-};
-
-if (shot) {
-  runShot(shot, seed);
-  document.getElementById('hud').hidden = shot === 'start';
-} else {
-  hud.showOverlay('start');
-  requestAnimationFrame(frame);
-}
+boot();
